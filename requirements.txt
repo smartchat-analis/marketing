@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+Flask
+numpy
+openai
+pandas
+requests
+anthropic

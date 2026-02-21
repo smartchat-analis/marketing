@@ -8,16 +8,9 @@ import requests
 import ast
 from openai import OpenAI
 from collections import OrderedDict
+from dotenv import load_dotenv
 import anthropic
-from list_product import CODE_PRODUCT
 import sqlite3
-from knowledge_website import KNOWLEDGE_WEBSITE
-from knowledge_SEO import KNOWLEDGE_SEO
-from knowledge_google_ads import KNOWLEDGE_GOOGLE_ADS
-from knowledge_sosmed_ads import KNOWLEDGE_SOSMED_ADS
-from knowlede_comprof import KNOWLEDGE_COMPROF
-from knowledge_sosmed import KNOWLEDGE_SOSMED
-from knowledge_layanan_digital import KNOWLEDGE_LAYANAN_DIGITAL
 
 def get_db(path):
     return sqlite3.connect(path, check_same_thread=False)
@@ -45,11 +38,18 @@ EMBEDDING_CACHE = OrderedDict()
 EMBEDDING_CACHE_MAX_SIZE = 1000
 SESSION_CLEANUP_THRESHOLD = 100
 SESSION_STORE_MAX_SIZE = 500
+load_dotenv()
+openai_api_key = os.getenv("OPENAI_API_KEY")
+anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+if not openai_api_key:
+    raise ValueError("OPENAI_API_KEY tidak ditemukan di environment variable")
+if not anthropic_api_key:
+    raise ValueError("ANTHROPIC_API_KEY tidak ditemukan di environment variable")
 client = OpenAI(
-    api_key="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"
+    api_key=openai_api_key
 )
 claude_client = anthropic.Anthropic(
-    api_key="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"
+    api_key=anthropic_api_key
 )
 SESSION_STORE = {}
 SESSION_LOCK = threading.Lock()
@@ -223,7 +223,7 @@ def build_conversation_context(session_data, max_messages=10):
         return []
     return history[-max_messages:]
 
-def get_top_priority_candidates(candidates, top_k=3):
+def get_top_priority_candidates(candidates, top_k=5):
     if not candidates:
         return []
     for c in candidates:
@@ -239,6 +239,46 @@ def get_top_priority_candidates(candidates, top_k=3):
         reverse=True
     )
     return candidates_sorted[:top_k]
+
+# ===============================
+# ITERATIVE RAG RETRIEVAL ENGINE
+# ===============================
+def iterative_node_search(
+    user_vec,
+    user_message,
+    user_category,
+    prev_node_id,
+    assistant_category,
+    max_attempts=5
+):
+    threshold = dynamic_threshold(user_message)
+
+    for attempt in range(max_attempts):
+        best, metadata = find_best_user_node(
+            user_vec,
+            user_message,
+            user_category=user_category,
+            prev_node_id=prev_node_id,
+            assistant_category=assistant_category,
+            custom_threshold=threshold
+        )
+
+        if best:
+            return best, metadata
+
+        # turunkan threshold bertahap
+        threshold *= 0.9
+
+    # fallback: ambil similarity tertinggi walau di bawah threshold
+    best, metadata = find_best_user_node(
+        user_vec,
+        user_message,
+        user_category=None,
+        prev_node_id=None,
+        assistant_category=None
+    )
+
+    return best, metadata
 
 # ===========================
 # LLM 2 LAYER
@@ -263,237 +303,111 @@ def llm_validate_and_generate(
 
     prompt = f"""
     KAMU adalah Admin Marketing WhatsApp profesional untuk layanan:
-    pembuatan website, SEO, google ads, sosmed ads, kelola sosmed, company profile pdf, pembuatan akun sosmed, pembuatan google maps, pembuatan email bisnis, dan
-    layanan digital marketing lainnya.
+    pembuatan website, SEO, Google Ads, sosial media ads, kelola sosial media,
+    company profile PDF, pembuatan akun sosial media, pembuatan Google Maps,
+    pembuatan email bisnis, dan layanan digital marketing lainnya.
+
+    PERAN UTAMA KAMU:
+    Bukan membuat jawaban panjang.
+    Tugas kamu adalah:
+
+    1. Memvalidasi hasil dari proses routing & knowledge selection
+    2. Mengolah kandidat jawaban terbaik agar lebih natural
+    3. Menjawab secukupnya sesuai pertanyaan user
+    4. Tetap terlihat seperti admin manusia, bukan bot
 
     =====================================================
-    IDENTITAS ADMIN (WAJIB DIPATUHI)
+    PRINSIP UTAMA
     =====================================================
 
-    Jika klien MENANYAKAN nama kamu:
-    - Jika konteks berasal dari perusahaan EDA atau Asain → jawab nama: Aisyah
-    - Jika konteks berasal dari perusahaan EBYB → jawab nama: Alesha
-    - Jika asal perusahaan tidak diketahui → perkenalkan diri sebagai admin marketing (tanpa nama spesifik)
+    - Fokus pada kandidat jawaban paling relevan (prioritas pertama).
+    - Jangan merangkum semua knowledge sekaligus.
+    - Jangan menampilkan terlalu banyak informasi dalam satu pesan.
+    - Jangan menggabungkan semua kemungkinan jawaban.
+    - Jangan terlihat seperti FAQ generator.
 
-    Aturan ketat:
-    - Dilarang menyebut nama lain
-    - Dilarang mengganti nama di luar aturan
-    - Jika tidak ditanya nama → jangan memperkenalkan diri
+    Jika kandidat pertama sudah sesuai dan tidak bertentangan
+    dengan kandidat lain:
+    → Gunakan jawaban tersebut.
+    → Rapikan bahasanya agar lebih natural.
+    → Jangan diperpanjang tanpa alasan.
 
     =====================================================
-    PRIORITAS KONTROL KONTEKS
+    BATAS PANJANG JAWABAN
     =====================================================
 
-    Urutan prioritas memahami konteks:
+    - Jawab hanya sesuai yang ditanyakan user.
+    - Jangan memberi informasi tambahan yang belum diminta.
+    - Hindari paragraf panjang.
+    - Hindari list panjang kecuali memang diminta.
+    - Jangan kirim banyak link sekaligus kecuali diminta secara spesifik.
+    - Default: 2–5 kalimat saja.
 
+    Tujuan:
+    Agar tidak terlihat seperti bot atau sales script panjang.
+
+    =====================================================
+    JIKA TIDAK ADA NODE TERPILIH
+    =====================================================
+
+    Jika setelah proses routing tidak ada knowledge yang relevan,
+    atau jawabannya berpotensi tidak akurat:
+
+    Gunakan respon berikut secara persis:
+
+    "Terima kasih atas pertanyaannya😊 Untuk memastikan informasi yang sesuai, izin kami koordinasikan terlebih dahulu dengan tim terkait ya. Nanti akan segera kami informasikan kembali🙏"
+
+    Jangan dimodifikasi.
+    Jangan ditambahkan kalimat lain.
+
+    =====================================================
+    KONTROL KONTEKS
+    =====================================================
+
+    Prioritas pemahaman:
     1) SUMMARY CONTEXT
     2) USER MESSAGE terbaru
     3) KNOWLEDGE CONTEXT
 
-    Jika KNOWLEDGE tidak relevan dengan SUMMARY atau USER MESSAGE, boleh diabaikan.
+    Jika knowledge terlalu banyak:
+    → Ambil yang paling relevan dengan pertanyaan terakhir saja.
+
+    Jika knowledge tidak relevan:
+    → Abaikan.
+
+    =====================================================
+    ANTI-OVEREXPLAIN
+    =====================================================
 
     Dilarang:
-    - Mengganti topik layanan tanpa diminta
-    - Menawarkan layanan lain di luar topik aktif
-    - Mengambil knowledge yang tidak relevan
-    - Melompat pembahasan
+
+    - Mengirim 5–10 contoh link sekaligus tanpa diminta
+    - Memberikan semua detail paket dalam satu pesan
+    - Menjelaskan seluruh layanan jika user hanya tanya satu hal
+    - Memberikan promosi panjang tanpa diminta
 
     =====================================================
-    KONSISTENSI INFORMASI & ANTI-PENGULANGAN
+    GAYA KOMUNIKASI
     =====================================================
 
-    Sebelum mengajukan pertanyaan atau meminta konfirmasi:
-
-    - Periksa apakah informasi tersebut sudah disebutkan atau dikonfirmasi sebelumnya di SUMMARY CONTEXT atau riwayat percakapan.
-    - Jika sudah pernah disebutkan atau dikonfirmasi oleh klien, DILARANG menanyakannya kembali.
-    - Jangan meminta klien mengulang informasi yang sudah jelas.
-    - Jangan mengulang pertanyaan yang sama dengan redaksi berbeda.
-    - Jangan berpura-pura tidak tahu jika informasi sudah tersedia di konteks.
-
-    Jika klien sudah:
-    - Memilih paket
-    - Menentukan layanan
-    - Menyebut budget
-    - Memberikan detail kebutuhan
-
-    Maka gunakan informasi tersebut sebagai fakta yang sudah valid.
-    Jangan konfirmasi ulang kecuali ada perubahan atau ketidakjelasan.
-
-    Tujuan:
-    Jawaban harus menunjukkan bahwa admin fokus, memperhatikan detail, dan memahami percakapan secara konsisten.
-
-    =====================================================
-    SISTEM MODE OTOMATIS (AKTIF JIKA RELEVAN)
-    =====================================================
-
-    Aktifkan mode sesuai topik berikut:
-
-    • WEBSITE  
-    (paket website, domain, hosting, fitur, webmail/email bisnis,
-    payment gateway, toko online, multibahasa, redesign,
-    only design, hapus copyright, beli putus, custom website)
-    → Gunakan KNOWLEDGE_CONTEXT + KNOWLEDGE_WEBSITE  
-    → KNOWLEDGE_WEBSITE adalah sumber utama fitur, harga, aturan  
-    → Jika konflik, ikuti KNOWLEDGE_WEBSITE  
-    → Jangan jelaskan seluruh paket jika tidak diminta  
-
-    • SEO  
-    (optimasi website, ranking Google, keyword, SEO web dalam/luar, biaya SEO)
-    → Gunakan KNOWLEDGE_CONTEXT + KNOWLEDGE_SEO  
-    → KNOWLEDGE_SEO adalah sumber utama sistem kerja, harga, kontrak  
-
-    • GOOGLE ADS  
-    (iklan Google, CPC, saldo harian, paket mingguan/bulanan, tracking konversi, setup akun & campaign)
-    → Gunakan KNOWLEDGE_CONTEXT + KNOWLEDGE_GOOGLE_ADS  
-    → KNOWLEDGE_GOOGLE_ADS adalah sumber utama paket & aturan  
-
-    • SOSMED ADS  
-    (Instagram Ads, Facebook Ads, TikTok Ads, YouTube Ads, saldo harian, paket iklan, optimasi iklan sosial media)
-    → Gunakan KNOWLEDGE_CONTEXT + KNOWLEDGE_SOSMED_ADS  
-    → Ikuti alur: Segmentasi → Edukasi → Ringkasan → Detail jika diminta  
-    → Tidak bisa DP  
-
-    • COMPANY PROFILE PDF  
-    (pembuatan company profile dalam bentuk dokumen/PDF,harga paket, revisi, bonus logo/kartu nama)
-    → Gunakan KNOWLEDGE_CONTEXT + KNOWLEDGE_COMPROF  
-    → Pastikan benar PDF, bukan website  
-    → Jika website → alihkan ke MODE WEBSITE  
-
-    • SOSIAL MEDIA NON-ADS  
-    (pembuatan akun IG/FB/YouTube, halaman bisnis, jasa kelola IG/FB/TikTok/YouTube, tambah followers IG, viewers IG, TikTok likes/views)
-    → Gunakan KNOWLEDGE_CONTEXT + KNOWLEDGE_SOSMED  
-    → Jika ternyata iklan → alihkan ke MODE SOSMED ADS  
-
-    • LAYANAN DIGITAL LAINNYA  
-    (artikel ID/EN, video promosi, desain banner, desain kartu nama, desain logo, LinkTree, proposal bisnis, promosi status WA, Google Maps)
-    → Gunakan KNOWLEDGE_CONTEXT + KNOWLEDGE_LAYANAN_DIGITAL  
-    → Pastikan bukan website atau layanan iklan  
-
-    Jika terjadi perbedaan informasi → ikuti knowledge modul yang aktif.  
-    Jika tidak ada di knowledge → gunakan fallback koordinasi tim.
-    
-    =====================================================
-    GLOBAL RULE – CODE_PRODUCT
-    =====================================================
-
-    - CODE_PRODUCT hanya digunakan jika di knowledge secara eksplisit terdapat instruksi: (pakai CODE_PRODUCT "NAMA_CODE")
-    - Jika tidak ada instruksi tersebut di knowledge, maka jangan gunakan placeholder.
-    - Jangan mengarang atau mengubah nama code.
-    - Jika tidak ada harga utama → jangan tampilkan CODE_PRODUCT.
-    - Jika beberapa paket → setiap harga utama paket wajib memiliki CODE_PRODUCT masing-masing.
-    - CODE_PRODUCT tidak boleh dijelaskan ke user.
-
-    =====================================================
-    DETEKSI PESAN RENDAH INFORMASI
-    =====================================================
-
-    Jika USER MESSAGE hanya berupa:
-    - typo
-    - koreksi singkat
-    - emoji
-    - respon pendek tanpa konteks bisnis
-
-    Maka:
-    - Jangan gunakan knowledge
-    - Jangan bahas layanan
-    - Balas natural sesuai konteks sebelumnya
-    - Maksimal 2 kalimat
-
-    =====================================================
-    MODE KERJA UTAMA
-    =====================================================
-
-    A. Jika KNOWLEDGE tersedia dan relevan:
-    - Gunakan hanya informasi dari KNOWLEDGE
-    - Ambil semua poin relevan
-    - Jangan menambah fakta
-    - Jangan mengarang
-    - Jangan keluar dari topik aktif
-    - Boleh 1 pertanyaan klarifikasi jika memang diperlukan
-
-    B. Jika KNOWLEDGE kosong:
-    - Jangan menjawab detail layanan
-    - Ajukan 1 pertanyaan klarifikasi
-
-    Jika user menanyakan layanan/detail yang tidak tersedia:
-    Gunakan fallback koordinasi tim.
-
-    =====================================================
-    ATURAN FORMAT KETAT
-    =====================================================
-
-    - Dilarang menggunakan tanda seru (!)
-    - Jika muncul tanda seru, hapus sebelum output
+    - Profesional
+    - Natural
+    - Tidak agresif
+    - Tidak berlebihan
+    - Tidak menggunakan tanda seru (!)
     - Maksimal 2 emoticon ringan
-    - Jangan huruf kapital berlebihan
-    - Jangan promosi agresif
-    - Jangan gunakan format markdown seperti **bold**
-    - Jika ingin menebalkan teks, gunakan format WhatsApp:
-        contoh: *Paket Platinum*
+    - Tidak menggunakan markdown seperti **bold**
 
     =====================================================
     VALIDASI SEBELUM OUTPUT
     =====================================================
 
-    Sebelum mengeluarkan jawaban, pastikan:
-    1. Tidak ada tanda seru (!)
-    2. Tidak keluar dari topik aktif
-    3. Tidak mengulang pertanyaan yang sudah dikonfirmasi
-    4. Tidak menambah asumsi di luar knowledge
-    5. Jika MODE tertentu aktif → informasi mengikuti knowledge modul tersebut
-    6. Jika pesan rendah informasi → tidak membahas layanan
-
-    =================================
-    VALIDASI HARGA & CODE_PRODUCT
-    =================================
-
-    PRINSIP DASAR:
-    CODE_PRODUCT HANYA digunakan untuk harga yang secara eksplisit
-    di knowledge memiliki instruksi: (pakai CODE_PRODUCT "NAMA_CODE")
-
-    Jika di knowledge tidak ada instruksi tersebut,
-    maka nominal TIDAK BOLEH diganti placeholder.
-
-    -------------------------------------------------
-
-    ATURAN PENGGANTIAN HARGA UTAMA:
-    Jika suatu harga di knowledge memiliki instruksi (pakai CODE_PRODUCT "NAMA_CODE") maka:
-    - Nominal harga WAJIB DIGANTI SEPENUHNYA dengan: {"{{$price:NAMA_CODE}}"}
-    - Angka/nominal asli tidak boleh ditampilkan
-    - Tidak boleh menampilkan angka + placeholder berdampingan
-    - Placeholder menjadi satu-satunya representasi harga tersebut
-
-    -------------------------------------------------
-
-    ATURAN BREAKDOWN INTERNAL:
-    Jika jawaban menampilkan nominal yang merupakan bagian dari breakdown internal, seperti:
-    - Saldo iklan
-    - Biaya per hari
-    - Pajak
-    - Fee
-    - Registrasi
-    - Akun VVIP
-    - Biaya komponen lainnya
-    DAN di knowledge TIDAK ada instruksi (pakai CODE_PRODUCT "NAMA_CODE") untuk nominal tersebut:
-    Maka:
-    - Jangan gunakan placeholder
-    - Jangan mengganti angka
-    - Tampilkan nominal apa adanya
-    - Jangan membuat CODE_PRODUCT baru
-
-    -------------------------------------------------
-
-    JIKA MENAMPILKAN LEBIH DARI SATU PAKET:
-    - Setiap harga utama paket wajib menggunakan CODE_PRODUCT masing-masing sesuai knowledge
-    - Jangan menggunakan satu CODE_PRODUCT untuk seluruh angka dalam satu paket
-
-    -------------------------------------------------
-
-    JIKA TIDAK ADA INSTRUKSI CODE_PRODUCT DI KNOWLEDGE:
-    - Jangan menyisipkan placeholder apa pun
-
-    Sebelum mengeluarkan jawaban final, lakukan pengecekan ulang terhadap seluruh aturan di atas.
-    Jika ditemukan pelanggaran, koreksi terlebih dahulu, baru tampilkan output final.
+    Pastikan:
+    1. Jawaban tidak terlalu panjang
+    2. Tidak keluar dari pertanyaan user
+    3. Tidak merangkum seluruh knowledge
+    4. Tidak terlihat seperti template panjang
+    5. Tidak ada tanda seru (!)
 
     =====================================================
     INPUT
@@ -508,47 +422,16 @@ def llm_validate_and_generate(
     USER INTENT:
     {user_intent}
 
-    DAFTAR CODE_PRODUCT VALID:
-    {CODE_PRODUCT}
-
-    =====================================================
-    KNOWLEDGE CONTEXT (JIKA ADA)
-    =====================================================
-
+    KNOWLEDGE CONTEXT:
     {knowledge_context if knowledge_context else "(KOSONG)"}
-
-    =====================================================
-    KNOWLEDGE MODULES
-    =====================================================
-
-    --- KNOWLEDGE_WEBSITE ---
-    {KNOWLEDGE_WEBSITE}
-
-    --- KNOWLEDGE_SEO ---
-    {KNOWLEDGE_SEO}
-
-    --- KNOWLEDGE_GOOGLE_ADS ---
-    {KNOWLEDGE_GOOGLE_ADS}
-
-    --- KNOWLEDGE_SOSMED_ADS ---
-    {KNOWLEDGE_SOSMED_ADS}
-
-    --- KNOWLEDGE_SOSMED ---
-    {KNOWLEDGE_SOSMED}
-
-    --- KNOWLEDGE_COMPROF ---
-    {KNOWLEDGE_COMPROF}
-
-    --- KNOWLEDGE_LAYANAN_DIGITAL ---
-    {KNOWLEDGE_LAYANAN_DIGITAL}
 
     =====================================================
     OUTPUT (JSON ONLY)
     =====================================================
-    {{
-    "response": "response lengkap dengan placeholder harga jika ada",
-    "has_price": true/false
-    }}
+
+    {
+    "response": "jawaban final yang singkat, natural, dan tervalidasi"
+    }
     """
 
     try:
@@ -568,29 +451,18 @@ def llm_validate_and_generate(
 
         raw = resp.content[0].text.strip()
         logger.debug(f"[LLM1 RAW OUTPUT] {raw[:300]}")
-        
-        # Parse JSON response
-        parsed = safe_parse_json(raw)
 
+        parsed = safe_parse_json(raw)
         if not parsed or "response" not in parsed:
             logger.warning("[LLM1] Invalid JSON output, using raw response")
             logger.debug(f"[LLM1 RAW FALLBACK] {raw}")
             return {
-                "response": raw,
-                "has_price": False
+                "response": raw
             }
-
-        # Check if response contains price placeholders
-        has_price = "{$price:" in parsed.get("response", "") or "{{$price:" in parsed.get("response", "")
-        
         logger.debug("[LLM1] JSON parsed successfully")
-        logger.debug(f"[LLM1] has_price={has_price}")
-
         return {
-            "response": parsed.get("response", ""),
-            "has_price": has_price
+            "response": parsed.get("response", "")
         }
-
     except Exception:
         logger.exception("[LLM1 ERROR] Claude validate+generate failed")
         raise
@@ -599,12 +471,10 @@ def sanitize_llm_response(
     user_message: str,
     user_intent: str,
     context: str,
-    final_response_llm1: str,
-    detected_code_product: str | None
+    final_response_llm1: str
 ):
     logger.debug("[LLM2] Sanitizing response")
     logger.debug(f"[LLM2] user_intent={user_intent}")
-    logger.debug(f"[LLM2] detected_code_product={detected_code_product}")
     logger.debug(f"[LLM2] LLM1_response_preview='{final_response_llm1[:200]}'")
 
     prompt = f"""
@@ -617,8 +487,6 @@ def sanitize_llm_response(
     - TIDAK membuat jawaban atau kalimat baru
     - TIDAK mengubah struktur kalimat
     - HANYA mengganti bagian sensitif dengan placeholder yang sesuai
-    - MENGGUNAKAN code_product yang SUDAH terdeteksi oleh LLM 1 untuk diaplikasikan ke placeholder {{$price:CODE_PRODUCT}}
-    - TIDAK perlu mendeteksi code_product lagi
 
     ================================================
     UNSUR SENSITIF (WAJIB DIGANTI)
@@ -678,33 +546,6 @@ def sanitize_llm_response(
     WAJIB diganti menjadi:
     {"{{$rekening_pembayaran}}"}
 
-    -----------------------------------------------------------------------------
-
-    4. Harga produk / layanan
-
-    JANGAN mengganti harga jika di dalam teks sudah terdapat placeholder {{$price:...}}.
-
-    Hanya lakukan penggantian jika:
-    - Masih ada angka harga asli
-    - Dan angka tersebut adalah harga utama paket
-    - Dan detected_code_product tidak null
-
-    Jangan mengganti angka yang merupakan bagian breakdown seperti:
-    - pajak
-    - fee
-    - registrasi
-    - saldo
-    - biaya per hari
-    - komponen lain
-
-    ================================================
-    CATATAN PENTING
-    ================================================
-
-    - code_product SUDAH dideteksi oleh LLM 1: {detected_code_product if detected_code_product else "TIDAK ADA"}
-    - JIKA ADA code_product → gunakan placeholder {"{{$price:{detected_code_product}}}"}
-    - JIKA TIDAK ADA code_product → cukup sanitize sensitive elements lain
-
     ================================================
     INPUT
     ================================================
@@ -724,7 +565,7 @@ def sanitize_llm_response(
     OUTPUT (JSON ONLY)
     ================================================
     {{
-    "response": "response dengan placeholder harga tetap utuh, hanya data sensitif diganti",
+    "response": "response hanya data sensitif yang diganti",
     "sensitive_found": true/false
     }}
     """
@@ -737,72 +578,50 @@ def sanitize_llm_response(
             temperature=0.0
         )
 
-        raw = resp.choices[0].message.content
+        raw = resp.choices[0].message.content.strip()
         logger.debug(f"[LLM2 RAW OUTPUT] {raw[:300]}")
 
-        match = re.search(r"\{[\s\S]*\}", raw)
+        # ==========================
+        # EXTRACT JSON
+        # ==========================
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
         if not match:
-            logger.warning("[LLM2] No JSON detected in response")
-            raise ValueError("No JSON found")
+            logger.warning("[LLM2] No JSON detected, using LLM1 result")
+            return {
+                "response": final_response_llm1
+            }
 
-        parsed = json.loads(match.group(0))
+        parsed = safe_parse_json(raw)
+        if not parsed:
+            return {"response": final_response_llm1}
 
-        logger.debug(
-            f"[LLM2 RESULT] applied_code_product={parsed.get('applied_code_product')}"
-        )
-
-        # ================================
-        # AMBIL RESPONSE TEXT
-        # ================================
         response_text = parsed.get("response")
+        sensitive_found = parsed.get("sensitive_found", False)
 
-        # ================================
-        # SAFETY CHECK – JANGAN RUSAK PLACEHOLDER
-        # ================================
-
-        # Jika placeholder sudah ada dari LLM1, jangan ubah apapun
-        if "{{$price:" in final_response_llm1:
-            logger.debug("[LLM2] Placeholder already exists from LLM1, skipping price modification")
-
-            return {
-                "response": final_response_llm1,
-                "applied_code_product": detected_code_product
-            }
-
-        # Jika LLM2 menghasilkan response dengan placeholder (safety net)
-        if response_text and "{{$price:" in response_text:
-            logger.debug("[LLM2] Price placeholder applied by LLM2 safety net")
-
-            return {
-                "response": response_text,
-                "applied_code_product": detected_code_product
-            }
+        logger.debug(f"[LLM2] sensitive_found={sensitive_found}")
 
         # ==========================
-        # NO SENSITIVE ELEMENT FOUND
+        # LOGIC UTAMA
         # ==========================
-        if response_text is None:
-            logger.debug("[LLM2] No sensitive element found")
-
+        if response_text:
+            # Kalau ada hasil sanitize → pakai hasil LLM2
+            logger.debug("[LLM2] Returning sanitized response")
             return {
-                "response": final_response_llm1,
-                "applied_code_product": detected_code_product
+                "response": response_text
             }
 
-        # Default: return LLM2 response dengan applied_code_product dari LLM1
+        # Kalau response kosong → fallback
+        logger.warning("[LLM2] Response empty, fallback to LLM1")
         return {
-            "response": response_text,
-            "applied_code_product": detected_code_product
+            "response": final_response_llm1
         }
 
     except Exception:
         logger.exception("[LLM2 ERROR] Sanitize layer failed")
-
         return {
-            "response": final_response_llm1,
-            "applied_code_product": detected_code_product
+            "response": final_response_llm1
         }
-    
+
 # =================================
 # INTENT AND CATEGORY CLASSIFIER
 # =================================
@@ -920,12 +739,13 @@ def find_best_user_node(
     user_message,
     user_category=None,
     prev_node_id=None,
-    assistant_category=None
+    assistant_category=None,
+    custom_threshold=None
 ):
     logger.debug("[ROUTING] Start find_best_user_node")
 
     candidates, flow_candidates, global_candidates = [], [], []
-    threshold = dynamic_threshold(user_message)
+    threshold = custom_threshold if custom_threshold is not None else dynamic_threshold(user_message)
     user_norm = normalize_text(user_message)
 
     logger.debug(f"[ROUTING] threshold={threshold}")
@@ -1011,14 +831,14 @@ def find_best_user_node(
     # ======================
     candidates.sort(key=lambda x: x[1], reverse=True)
     best = candidates[0]
-    top_3 = candidates[:3]
+    top_5 = candidates[:5]
 
     logger.debug(
         f"[ROUTING] best_node={best[0]} "
         f"sim={round(best[1],3)} "
         f"source={best[2]}"
     )
-    logger.debug(f"[ROUTING] top_3={[(c[0], round(c[1],3), c[2]) for c in top_3]}")
+    logger.debug(f"[ROUTING] top_5={[(c[0], round(c[1],3), c[2]) for c in top_5]}")
 
     return best, {
         "flow_count": len(flow_candidates),
@@ -1026,20 +846,20 @@ def find_best_user_node(
         "best_sim": best[1],
         "best_type": best[2],
         "best_user_node_id": best[0],
-        "top_3_user_nodes": [
+        "top_5_user_nodes": [
             {
                 "node_id": cid,
                 "similarity": round(sim, 3),
                 "source": src
             }
-            for cid, sim, src in top_3
+            for cid, sim, src in top_5
         ]
     }
 
-def collect_assistant_knowledge_from_user_nodes(top_3_user_nodes):
+def collect_assistant_knowledge_from_user_nodes(top_5_user_nodes):
     knowledge_chunks = []
 
-    for item in top_3_user_nodes:
+    for item in top_5_user_nodes:
         user_node_id = item["node_id"]
         node = NODES.get(user_node_id)
 
@@ -1074,10 +894,10 @@ def resolve_assistant_node_from_best_user(best_user_node_id):
 
 def get_response_from_knowledge(
     best_user_node_id,
-    top_3_user_nodes
+    top_5_user_nodes
 ):
     knowledge = collect_assistant_knowledge_from_user_nodes(
-        top_3_user_nodes
+        top_5_user_nodes
     )
 
     if not knowledge:
@@ -1106,17 +926,12 @@ def generate_assistant_response(
 ):
     user_vec = embed_text(user_message)
 
-    force_flow = (
-        prev_node_id is not None
-        and len(user_message.split()) <= 5
-    )
-
-    best_user_node, metadata = find_best_user_node(
+    best_user_node, metadata = iterative_node_search(
         user_vec,
         user_message,
-        user_category=user_category,
-        prev_node_id=prev_node_id if force_flow else None,
-        assistant_category=assistant_category
+        user_category,
+        prev_node_id,
+        assistant_category
     )
 
     # ==============================
@@ -1137,34 +952,22 @@ def generate_assistant_response(
         # ============================================
         logger.debug(f"[LLM1 RESULT] keys={llm_result.keys()}")
         logger.debug(f"[LLM1 RESULT] response_preview={str(llm_result.get('response', ''))[:100]}")
-        logger.debug(f"[LLM1 RESULT] detected_code_product={llm_result.get('detected_code_product')}")
 
-        # ============================================
-        # FIX: Gunakan key yang benar
-        # ============================================
         raw_response = llm_result.get("response", "")
-        detected_code = llm_result.get("detected_code_product")
 
         sanitized = sanitize_llm_response(
             user_message=user_message,
             user_intent=detected_intent,
             context=" | ".join(m["content"] for m in context_messages) if context_messages else "",
-            final_response_llm1=raw_response,
-            detected_code_product=detected_code  # FIX: parameter名称
+            final_response_llm1=raw_response
         )
 
         final_response = sanitized.get("response", raw_response)
-        applied_code = sanitized.get("applied_code_product")
 
         # ============================================
         # DEBUG: Log LLM2 result
         # ============================================
-        logger.debug(f"[LLM2 RESULT] applied_code_product={applied_code}")
         logger.debug(f"[LLM2 RESULT] response_preview={str(final_response)[:100]}")
-
-        # Validasi
-        if "{{price:" in final_response and not applied_code:
-            raise ValueError("Price placeholder detected without product code")
 
         return {
             "response": final_response,
@@ -1179,7 +982,7 @@ def generate_assistant_response(
 
     knowledge_data = get_response_from_knowledge(
         best_user_node_id=user_node_id,
-        top_3_user_nodes=metadata["top_3_user_nodes"]
+        top_5_user_nodes=metadata["top_5_user_nodes"]
     )
 
     llm_result = llm_validate_and_generate(
@@ -1194,36 +997,24 @@ def generate_assistant_response(
     # ============================================
     logger.debug(f"[LLM1 RESULT] keys={llm_result.keys()}")
     logger.debug(f"[LLM1 RESULT] response_preview={str(llm_result.get('response', ''))[:100]}")
-    logger.debug(f"[LLM1 RESULT] detected_code_product={llm_result.get('detected_code_product')}")
 
-    # ============================================
-    # FIX: Gunakan key yang benar
-    # ============================================
     raw_response = llm_result.get("response", "")
-    detected_code = llm_result.get("detected_code_product")
 
     # FINAL QUALITY CONTROL
     sanitized = sanitize_llm_response(
         user_message=user_message,
         user_intent=NODES.get(user_node_id, {}).get("intent", ""),
         context=" | ".join(m["content"] for m in context_messages) if context_messages else "",
-        final_response_llm1=raw_response,
-        detected_code_product=detected_code  # FIX: parameter名称
+        final_response_llm1=raw_response
     )
 
     final_response = sanitized.get("response", raw_response)
     final_response = final_response.replace("!", "")
-    applied_code = sanitized.get("applied_code_product")
 
     # ============================================
     # DEBUG: Log LLM2 result
-    # ============================================
-    logger.debug(f"[LLM2 RESULT] applied_code_product={applied_code}")
+    # ============================================logger.debug(f"[LLM2 RESULT] applied_code_product={applied_code}")
     logger.debug(f"[LLM2 RESULT] response_preview={str(final_response)[:100]}")
-
-    # Validasi
-    if "{{price:" in final_response and not applied_code:
-        raise ValueError("Price placeholder detected without product code")
 
     return {
         "response": final_response,
@@ -1305,12 +1096,12 @@ def chat_with_session(user_message, session_id, reset=False):
         "best_similarity": round(metadata.get("best_sim", 0), 3),
         "best_user_node_id": metadata.get("best_user_node_id"),
 
-        # TOP 3 USER NODE AS KNOWLEDGE SOURCE
-        "top_3_user_nodes": metadata.get("top_3_user_nodes", []),
+        # TOP 5 USER NODE AS KNOWLEDGE SOURCE
+        "top_5_user_nodes": metadata.get("top_5_user_nodes", []),
 
         # RESULT
         "selected_user_node": metadata.get("best_user_node_id")
-        if metadata.get("top_3_user_nodes") else None,
+        if metadata.get("top_5_user_nodes") else None,
 
         "assistant_node_id": assistant_node_id,
         "assistant_intent": assistant_node.get("intent"),

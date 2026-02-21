@@ -2,3 +2,4 @@
 output/embeddings.db
 output/*
 /output/*
+.env

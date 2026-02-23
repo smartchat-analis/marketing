@@ -429,9 +429,9 @@ def llm_validate_and_generate(
     OUTPUT (JSON ONLY)
     =====================================================
 
-    {
+    {{
     "response": "jawaban final yang singkat, natural, dan tervalidasi"
-    }
+    }}
     """
 
     try:
@@ -457,11 +457,13 @@ def llm_validate_and_generate(
             logger.warning("[LLM1] Invalid JSON output, using raw response")
             logger.debug(f"[LLM1 RAW FALLBACK] {raw}")
             return {
-                "response": raw
+                "response": raw,
+                "prompt": prompt
             }
         logger.debug("[LLM1] JSON parsed successfully")
         return {
-            "response": parsed.get("response", "")
+            "response": parsed.get("response", ""),
+            "prompt": prompt
         }
     except Exception:
         logger.exception("[LLM1 ERROR] Claude validate+generate failed")
@@ -588,12 +590,16 @@ def sanitize_llm_response(
         if not match:
             logger.warning("[LLM2] No JSON detected, using LLM1 result")
             return {
-                "response": final_response_llm1
+                "response": final_response_llm1,
+                "prompt": prompt
             }
 
         parsed = safe_parse_json(raw)
         if not parsed:
-            return {"response": final_response_llm1}
+            return {
+                "response": final_response_llm1,
+                "prompt": prompt
+            }
 
         response_text = parsed.get("response")
         sensitive_found = parsed.get("sensitive_found", False)
@@ -607,19 +613,22 @@ def sanitize_llm_response(
             # Kalau ada hasil sanitize → pakai hasil LLM2
             logger.debug("[LLM2] Returning sanitized response")
             return {
-                "response": response_text
+                "response": response_text,
+                "prompt": prompt
             }
 
         # Kalau response kosong → fallback
         logger.warning("[LLM2] Response empty, fallback to LLM1")
         return {
-            "response": final_response_llm1
+            "response": final_response_llm1,
+            "prompt": prompt
         }
 
     except Exception:
         logger.exception("[LLM2 ERROR] Sanitize layer failed")
         return {
-            "response": final_response_llm1
+            "response": final_response_llm1,
+            "prompt": prompt
         }
 
 # =================================
@@ -972,7 +981,9 @@ def generate_assistant_response(
         return {
             "response": final_response,
             "node_id": None,
-            "metadata": metadata
+            "metadata": metadata,
+            "llm1_prompt": llm_result.get("prompt"),
+            "llm2_prompt": sanitized.get("prompt")
         }
 
     # ==============================
@@ -1019,7 +1030,9 @@ def generate_assistant_response(
     return {
         "response": final_response,
         "node_id": knowledge_data["assistant_node_id"],
-        "metadata": metadata
+        "metadata": metadata,
+        "llm1_prompt": llm_result.get("prompt"),
+        "llm2_prompt": sanitized.get("prompt")
     }
 
 # ======================
@@ -1115,7 +1128,9 @@ def chat_with_session(user_message, session_id, reset=False):
         "context_summary": " | ".join(
             f"{m['role']}: {m['content']}"
             for m in context_messages[-9:]
-        ) if context_messages else None
+        ) if context_messages else None,
+        "llm1_prompt": result.get("llm1_prompt"),
+        "llm2_prompt": result.get("llm2_prompt")
     }
 
     # ======================

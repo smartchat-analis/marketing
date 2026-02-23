@@ -268,6 +268,96 @@ from response_claude import chat_with_session, load_flow_and_embeddings
 load_flow_and_embeddings() 
 
 # ==========================
+# ANALYSIS DB SETUP
+# ==========================
+import json
+
+def init_analysis_db():
+    os.makedirs("output", exist_ok=True)
+    db = get_db("output/analysis.db")
+    cur = db.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS chat_analysis (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            session_id TEXT,
+            user_message TEXT,
+            response TEXT,
+            user_intent TEXT,
+            user_category TEXT,
+            match_type TEXT,
+            best_similarity REAL,
+            best_user_node_id TEXT,
+            top_5_user_nodes TEXT,
+            assistant_node_id TEXT,
+            assistant_intent TEXT,
+            assistant_category TEXT,
+            flow_candidates_count INTEGER,
+            global_candidates_count INTEGER,
+            context_summary TEXT,
+            llm1_prompt TEXT,
+            llm2_prompt TEXT
+        )
+    """)
+    db.commit()
+    
+    try:
+        cur.execute("ALTER TABLE chat_analysis ADD COLUMN llm1_prompt TEXT")
+        cur.execute("ALTER TABLE chat_analysis ADD COLUMN llm2_prompt TEXT")
+        db.commit()
+    except Exception:
+        pass
+        
+    db.close()
+
+def log_analysis_data(session_id, user_message, response, debug_info):
+    try:
+        db = get_db("output/analysis.db")
+        cur = db.cursor()
+        
+        user_intent = debug_info.get("user_intent", "")
+        user_category = debug_info.get("user_category", "")
+        match_type = debug_info.get("match_type", "")
+        best_similarity = debug_info.get("best_similarity", 0.0)
+        best_user_node_id = debug_info.get("best_user_node_id", "")
+        
+        top_5_user_nodes = debug_info.get("top_5_user_nodes", [])
+        top_5_json = json.dumps(top_5_user_nodes) if top_5_user_nodes else "[]"
+        
+        assistant_node_id = debug_info.get("assistant_node_id", "")
+        assistant_intent = debug_info.get("assistant_intent", "")
+        assistant_category = debug_info.get("assistant_category", "")
+        flow_candidates_count = debug_info.get("flow_candidates_count", 0)
+        global_candidates_count = debug_info.get("global_candidates_count", 0)
+        context_summary = debug_info.get("context_summary", "")
+        llm1_prompt = debug_info.get("llm1_prompt", "")
+        llm2_prompt = debug_info.get("llm2_prompt", "")
+
+        cur.execute("""
+            INSERT INTO chat_analysis (
+                session_id, user_message, response, user_intent, user_category,
+                match_type, best_similarity, best_user_node_id, top_5_user_nodes,
+                assistant_node_id, assistant_intent, assistant_category,
+                flow_candidates_count, global_candidates_count, context_summary,
+                llm1_prompt, llm2_prompt
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            session_id, user_message, response, user_intent, user_category,
+            match_type, best_similarity, best_user_node_id, top_5_json,
+            assistant_node_id, assistant_intent, assistant_category,
+            flow_candidates_count, global_candidates_count, context_summary,
+            llm1_prompt, llm2_prompt
+        ))
+        db.commit()
+        db.close()
+    except Exception as e:
+        import traceback
+        print(f"[ERROR] Failed to log analysis data: {e}")
+        print(traceback.format_exc())
+
+init_analysis_db()
+
+# ==========================
 # CHAT ENDPOINT
 # ==========================
 @app.route("/chat", methods=["POST"])
@@ -286,6 +376,10 @@ def chat():
 
     if not result or not result.get("response"):
         return jsonify({"error": "Failed to generate response"}), 500
+
+    # Log to analysis.db
+    debug_info = result.get("debug", {})
+    log_analysis_data(session_id, message, result["response"], debug_info)
 
     return jsonify({
         "response": result["response"],

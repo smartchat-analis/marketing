@@ -472,6 +472,7 @@ def llm_validate_and_generate(
     =====================================================
     BATASAN JAWABAN
     =====================================================
+    - Default 2–5 kalimat.
     - Jangan kirim list panjang kecuali diminta.
     - Jangan jelaskan semua paket jika hanya ditanya satu.
     - Maksimal 2 emoticon ringan.
@@ -646,8 +647,9 @@ def llm_optional_product_regenerate(
     - Tidak menambah informasi di luar knowledge
     3. Jangan mengarang harga, promo, atau detail teknis.
     4. Jawaban singkat dan natural.
-    5. Tidak menggunakan tanda seru.
-    6. Maksimal 2 emoticon ringan.
+    5. Maksimal 5 kalimat.
+    6. Tidak menggunakan tanda seru.
+    7. Maksimal 2 emoticon ringan.
 
     =====================================================
     INPUT TAMBAHAN

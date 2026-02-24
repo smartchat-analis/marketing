@@ -6,12 +6,13 @@ import threading
 import logging
 import requests
 import ast
+import time
 from openai import OpenAI
 from collections import OrderedDict
 from dotenv import load_dotenv
 import anthropic
 import sqlite3
-
+load_dotenv()
 def get_db(path):
     return sqlite3.connect(path, check_same_thread=False)
 
@@ -38,7 +39,6 @@ EMBEDDING_CACHE = OrderedDict()
 EMBEDDING_CACHE_MAX_SIZE = 1000
 SESSION_CLEANUP_THRESHOLD = 100
 SESSION_STORE_MAX_SIZE = 500
-load_dotenv()
 openai_api_key = os.getenv("OPENAI_API_KEY")
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 if not openai_api_key:
@@ -152,7 +152,7 @@ def normalize_text(t: str):
     return re.sub(r"\s+", " ", t.lower().strip())
 
 def cosine_similarity(vecA, vecB):
-    if not vecA or not vecB:
+    if len(vecA) != len(vecB):
         return 0.0
     dot = sum(a * b for a, b in zip(vecA, vecB))
     magA = sum(a * a for a in vecA) ** 0.5
@@ -185,37 +185,48 @@ def safe_parse_json(text):
 
     return None
 
-def embed_text(text: str):
+def embed_text(text: str, max_retries: int = 3):
     logger.debug(f"[EMBED] Request received | text_preview='{text[:50]}'")
+
+    if not text or not text.strip():
+        raise ValueError("embed_text received empty text")
 
     if text in EMBEDDING_CACHE:
         logger.debug("[EMBED CACHE HIT]")
         EMBEDDING_CACHE.move_to_end(text)
         return EMBEDDING_CACHE[text]
 
-    try:
-        logger.debug("[EMBED] Generating embedding from OpenAI")
+    last_exception = None
 
-        resp = client.embeddings.create(
-            model="text-embedding-3-large",
-            input=text
-        )
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.debug(f"[EMBED] Attempt {attempt}")
 
-        embedding = resp.data[0].embedding
+            resp = client.embeddings.create(
+                model="text-embedding-3-large",
+                input=text
+            )
 
-        logger.debug(f"[EMBED SUCCESS] vector_length={len(embedding)}")
+            embedding = resp.data[0].embedding
 
-        EMBEDDING_CACHE[text] = embedding
+            if not embedding or len(embedding) < 100:
+                raise ValueError("Embedding vector invalid or too short")
 
-        if len(EMBEDDING_CACHE) > EMBEDDING_CACHE_MAX_SIZE:
-            logger.debug("[EMBED CACHE] Max size reached, removing oldest item")
-            EMBEDDING_CACHE.popitem(last=False)
+            EMBEDDING_CACHE[text] = embedding
 
-        return embedding
+            if len(EMBEDDING_CACHE) > EMBEDDING_CACHE_MAX_SIZE:
+                EMBEDDING_CACHE.popitem(last=False)
 
-    except Exception:
-        logger.exception(f"[EMBED ERROR] Failed for text_preview='{text[:50]}'")
-        return []
+            logger.debug(f"[EMBED SUCCESS] vector_length={len(embedding)}")
+            return embedding
+
+        except Exception as e:
+            last_exception = e
+            logger.warning(f"[EMBED ERROR] attempt={attempt} | {e}")
+            time.sleep(0.8 * attempt)
+
+    logger.critical("[EMBED FAILED] All retries exhausted")
+    raise RuntimeError("Embedding generation failed") from last_exception
 
 def build_conversation_context(session_data, max_messages=10):
     history = session_data.get("history", [])
@@ -240,6 +251,96 @@ def get_top_priority_candidates(candidates, top_k=5):
     )
     return candidates_sorted[:top_k]
 
+def get_price_context(category_product_list):
+    price_chunks = []
+
+    for cat in category_product_list or []:
+        if cat == "WEBSITE":
+            from price_website import PRICE_WEBSITE
+            price_chunks.append(PRICE_WEBSITE)
+
+        elif cat == "SEO":
+            from price_seo import PRICE_SEO
+            price_chunks.append(PRICE_SEO)
+
+        elif cat == "GOOGLE_ADS":
+            from price_google_ads import PRICE_GOOGLE_ADS
+            price_chunks.append(PRICE_GOOGLE_ADS)
+
+        elif cat == "SOSMED_ADS":
+            from price_sosmed_ads import PRICE_SOSMED_ADS
+            price_chunks.append(PRICE_SOSMED_ADS)
+
+        elif cat == "COMPANY_PROFILE_PDF":
+            from price_comprof import PRICE_COMPROF
+            price_chunks.append(PRICE_COMPROF)
+
+        elif cat == "SOSIAL_MEDIA_NON_ADS":
+            from price_sosmed import PRICE_SOSMED
+            price_chunks.append(PRICE_SOSMED)
+
+        elif cat == "LAYANAN_DIGITAL_LAINNYA":
+            from price_lainnya import PRICE_LAINNYA
+            price_chunks.append(PRICE_LAINNYA)
+
+    return "\n\n".join(price_chunks)
+
+def get_product_knowledge(category_product_list):
+    knowledge_chunks = []
+
+    for cat in category_product_list or []:
+        if cat == "WEBSITE":
+            from knowledge_website import KNOWLEDGE_WEBSITE
+            knowledge_chunks.append(KNOWLEDGE_WEBSITE)
+
+        elif cat == "SEO":
+            from knowledge_SEO import KNOWLEDGE_SEO
+            knowledge_chunks.append(KNOWLEDGE_SEO)
+
+        elif cat == "GOOGLE_ADS":
+            from knowledge_google_ads import KNOWLEDGE_GOOGLE_ADS
+            knowledge_chunks.append(KNOWLEDGE_GOOGLE_ADS)
+
+        elif cat == "SOSMED_ADS":
+            from knowledge_sosmed_ads import KNOWLEDGE_SOSMED_ADS
+            knowledge_chunks.append(KNOWLEDGE_SOSMED_ADS)
+
+        elif cat == "COMPANY_PROFILE_PDF":
+            from knowledge_comprof import KNOWLEDGE_COMPROF
+            knowledge_chunks.append(KNOWLEDGE_COMPROF)
+
+        elif cat == "SOSIAL_MEDIA_NON_ADS":
+            from knowledge_sosmed import KNOWLEDGE_SOSMED
+            knowledge_chunks.append(KNOWLEDGE_SOSMED)
+
+        elif cat == "LAYANAN_DIGITAL_LAINNYA":
+            from knowledge_lainnya import KNOWLEDGE_LAINNYA
+            knowledge_chunks.append(KNOWLEDGE_LAINNYA)
+
+    return "\n\n".join(knowledge_chunks)
+
+# ============================
+# KNOWLEDGE MISMATCH DETECTOR
+# ============================
+def is_knowledge_mismatch(category_product, knowledge_context):
+    if not category_product or not knowledge_context:
+        return False
+
+    category_product = set(category_product)
+    knowledge_lower = knowledge_context.lower()
+
+    # Simple heuristic detection
+    if "WEBSITE" in category_product and "seo" in knowledge_lower:
+        return True
+
+    if "SEO" in category_product and "website" in knowledge_lower:
+        return True
+
+    if "GOOGLE_ADS" in category_product and "seo" in knowledge_lower:
+        return True
+
+    return False
+
 # ===============================
 # ITERATIVE RAG RETRIEVAL ENGINE
 # ===============================
@@ -253,7 +354,16 @@ def iterative_node_search(
 ):
     threshold = dynamic_threshold(user_message)
 
-    for attempt in range(max_attempts):
+    logger.debug("========== ITERATIVE RAG START ==========")
+    logger.debug(f"[ITERATIVE] user_message='{user_message}'")
+    logger.debug(f"[ITERATIVE] initial_threshold={round(threshold,3)}")
+    logger.debug(f"[ITERATIVE] max_attempts={max_attempts}")
+
+    for attempt in range(1, max_attempts + 1):
+
+        logger.debug(f"----- Attempt {attempt} -----")
+        logger.debug(f"[ITERATIVE] threshold={round(threshold,3)}")
+
         best, metadata = find_best_user_node(
             user_vec,
             user_message,
@@ -263,20 +373,53 @@ def iterative_node_search(
             custom_threshold=threshold
         )
 
+        flow_count = metadata.get("flow_count")
+        global_count = metadata.get("global_count")
+
+        logger.debug(f"[ITERATIVE] flow_candidates={flow_count}")
+        logger.debug(f"[ITERATIVE] global_candidates={global_count}")
+
         if best:
+            logger.debug(
+                f"[ITERATIVE SUCCESS] attempt={attempt} | "
+                f"node_id={best[0]} | "
+                f"similarity={round(best[1],3)} | "
+                f"source={best[2]}"
+            )
+            logger.debug("========== ITERATIVE RAG END ==========")
             return best, metadata
+
+        logger.debug(f"[ITERATIVE] No match on attempt {attempt}")
 
         # turunkan threshold bertahap
         threshold *= 0.9
 
-    # fallback: ambil similarity tertinggi walau di bawah threshold
+    # ===============================
+    # FINAL FALLBACK (FORCE BEST MATCH)
+    # ===============================
+    logger.debug("----- FINAL FALLBACK -----")
+    logger.debug("[ITERATIVE] Forcing best similarity without threshold")
+
     best, metadata = find_best_user_node(
         user_vec,
         user_message,
         user_category=None,
         prev_node_id=None,
-        assistant_category=None
+        assistant_category=None,
+        custom_threshold=0.2
     )
+
+    if best:
+        logger.debug(
+            f"[ITERATIVE FALLBACK RESULT] "
+            f"node_id={best[0]} | "
+            f"similarity={round(best[1],3)} | "
+            f"source={best[2]}"
+        )
+    else:
+        logger.debug("[ITERATIVE FALLBACK RESULT] No node found at all")
+
+    logger.debug("========== ITERATIVE RAG END ==========")
 
     return best, metadata
 
@@ -302,112 +445,90 @@ def llm_validate_and_generate(
     logger.debug(f"[LLM1] context_length={len(context)}")
 
     prompt = f"""
-    KAMU adalah Admin Marketing WhatsApp profesional untuk layanan:
-    pembuatan website, SEO, Google Ads, sosial media ads, kelola sosial media,
-    company profile PDF, pembuatan akun sosial media, pembuatan Google Maps,
-    pembuatan email bisnis, dan layanan digital marketing lainnya.
+    Kamu adalah Admin Marketing WhatsApp representatif sebuah agency digital.
+    Jawab pertanyaan user dengan ringkas, profesional, natural, dan tidak seperti bot.
 
-    PERAN UTAMA KAMU:
-    Bukan membuat jawaban panjang.
-    Tugas kamu adalah:
-
-    1. Memvalidasi hasil dari proses routing & knowledge selection
-    2. Mengolah kandidat jawaban terbaik agar lebih natural
-    3. Menjawab secukupnya sesuai pertanyaan user
-    4. Tetap terlihat seperti admin manusia, bukan bot
+    TUGAS UTAMA:
+    1. Validasi dan olah KNOWLEDGE CONTEXT yang sudah dipilih sistem.
+    2. Jawab secukupnya sesuai pertanyaan terakhir user.
+    3. Jangan overexplain, jangan seperti FAQ generator.
+    4. Tetap terdengar seperti admin manusia.
 
     =====================================================
-    PRINSIP UTAMA
+    ATURAN MENJAWAB
     =====================================================
+    1. Prioritaskan KNOWLEDGE CONTEXT sebagai referensi utama.
+    2. Gunakan SUMMARY CONTEXT sebagai riwayat percakapan.
+    3. Jika knowledge sebagian tidak relevan (retrieval mismatch), ambil bagian yang relevan saja.
+    4. Jika knowledge kosong atau tidak relevan:
+    - Boleh gunakan pengetahuan umum tentang digital marketing.
+    - TETAPI dilarang keras mengarang informasi krusial perusahaan
+        (nama paket, harga spesifik, promo, syarat khusus, kontak, alamat, rekening).
 
-    - Fokus pada kandidat jawaban paling relevan (prioritas pertama).
-    - Jangan merangkum semua knowledge sekaligus.
-    - Jangan menampilkan terlalu banyak informasi dalam satu pesan.
-    - Jangan menggabungkan semua kemungkinan jawaban.
-    - Jangan terlihat seperti FAQ generator.
-
-    Jika kandidat pertama sudah sesuai dan tidak bertentangan
-    dengan kandidat lain:
-    → Gunakan jawaban tersebut.
-    → Rapikan bahasanya agar lebih natural.
-    → Jangan diperpanjang tanpa alasan.
-
-    =====================================================
-    BATAS PANJANG JAWABAN
-    =====================================================
-
-    - Jawab hanya sesuai yang ditanyakan user.
-    - Jangan memberi informasi tambahan yang belum diminta.
-    - Hindari paragraf panjang.
-    - Hindari list panjang kecuali memang diminta.
-    - Jangan kirim banyak link sekaligus kecuali diminta secara spesifik.
-    - Default: 2–5 kalimat saja.
-
-    Tujuan:
-    Agar tidak terlihat seperti bot atau sales script panjang.
+    Jika user menanyakan info krusial yang tidak ada di knowledge:
+    Gunakan respon ini:
+    "Terima kasih atas pertanyaannya😊 Untuk memastikan informasi yang akurat, izin kami koordinasikan terlebih dahulu dengan tim terkait ya. Nanti akan segera kami informasikan kembali🙏"
 
     =====================================================
-    JIKA TIDAK ADA NODE TERPILIH
+    BATASAN JAWABAN
     =====================================================
-
-    Jika setelah proses routing tidak ada knowledge yang relevan,
-    atau jawabannya berpotensi tidak akurat:
-
-    Gunakan respon berikut secara persis:
-
-    "Terima kasih atas pertanyaannya😊 Untuk memastikan informasi yang sesuai, izin kami koordinasikan terlebih dahulu dengan tim terkait ya. Nanti akan segera kami informasikan kembali🙏"
-
-    Jangan dimodifikasi.
-    Jangan ditambahkan kalimat lain.
+    - Jangan kirim list panjang kecuali diminta.
+    - Jangan jelaskan semua paket jika hanya ditanya satu.
+    - Maksimal 2 emoticon ringan.
+    - Tidak boleh menggunakan tanda seru (!).
+    - Jangan gunakan markdown seperti **bold**, gunakan format WhatsApp jika perlu (*contoh*).
 
     =====================================================
-    KONTROL KONTEKS
+    DETEKSI CATEGORY PRODUCT (WAJIB)
     =====================================================
+    Tentukan produk yang dibahas berdasarkan prioritas berikut:
+    1. USER MESSAGE (eksplisit)
+    2. USER INTENT
+    3. SUMMARY CONTEXT
 
-    Prioritas pemahaman:
-    1) SUMMARY CONTEXT
-    2) USER MESSAGE terbaru
-    3) KNOWLEDGE CONTEXT
+    Kategori yang diperbolehkan:
+    1. WEBSITE  
+    (paket website, buat website, harga website, domain, hosting, fitur website, webmail/email bisnis, payment gateway, toko online, multibahasa, redesign website,
+    only design, hapus copyright, beli putus, custom website)
 
-    Jika knowledge terlalu banyak:
-    → Ambil yang paling relevan dengan pertanyaan terakhir saja.
+    2. SEO  
+    (optimasi website agar muncul di hasil pencarian Google, peningkatan ranking keyword, riset keyword, on-page SEO, technical SEO, optimasi konten,
+    laporan performa, biaya & paket SEO)
 
-    Jika knowledge tidak relevan:
-    → Abaikan.
+    3. GOOGLE_ADS  
+    (iklan Google, mengiklankan website di Google, pembuatan akun Google Ads, pemasangan tracking konversi Google Ads, penyetingan kampanye Google Ads)
+
+    4. SOSMED_ADS  
+    (Instagram Ads, Facebook Ads, TikTok Ads, YouTube Ads, optimasi iklan sosial media, meningkatkan penjualan/leads lewat iklan sosial media)
+
+    5. COMPANY_PROFILE_PDF  
+    (pembuatan company profile dalam bentuk dokumen/PDF, bukan website)
+
+    6. SOSIAL_MEDIA_NON_ADS  
+    (pembuatan akun IG/FB/YouTube, jasa kelola IG/FB/TikTok/YouTube, tambah followers IG, tambah viewers IG, tambah likes TikTok)
+
+    7. LAYANAN_DIGITAL_LAINNYA  
+    (artikel ID/EN, video promosi, desain banner, kartu nama, desain logo, LinkTree, proposal bisnis, promosi status WA, pembuatan Google Bisnis/Google Maps)
+    
+    Aturan:
+    - Jika eksplisit menyebut sebuah produk misalnya website → WAJIB ["WEBSITE"]
+    - Jika lebih dari satu → kembalikan dalam ARRAY contoh ["WEBSITE", "SEO"]
+    - Jika hanya greeting tanpa konteks → null
+    - Dilarang membuat kategori baru
+    - Dilarang mengembalikan array kosong []
 
     =====================================================
-    ANTI-OVEREXPLAIN
+    SELF-EVALUATION (WAJIB)
     =====================================================
-
-    Dilarang:
-
-    - Mengirim 5–10 contoh link sekaligus tanpa diminta
-    - Memberikan semua detail paket dalam satu pesan
-    - Menjelaskan seluruh layanan jika user hanya tanya satu hal
-    - Memberikan promosi panjang tanpa diminta
-
-    =====================================================
-    GAYA KOMUNIKASI
-    =====================================================
-
-    - Profesional
-    - Natural
-    - Tidak agresif
-    - Tidak berlebihan
-    - Tidak menggunakan tanda seru (!)
-    - Maksimal 2 emoticon ringan
-    - Tidak menggunakan markdown seperti **bold**
-
-    =====================================================
-    VALIDASI SEBELUM OUTPUT
-    =====================================================
-
-    Pastikan:
-    1. Jawaban tidak terlalu panjang
-    2. Tidak keluar dari pertanyaan user
-    3. Tidak merangkum seluruh knowledge
-    4. Tidak terlihat seperti template panjang
-    5. Tidak ada tanda seru (!)
+    Tentukan:
+    - "knowledge_relevant": true jika KNOWLEDGE CONTEXT benar-benar relevan dengan pertanyaan terakhir.
+    - false jika kosong / mismatch / beda produk.
+    - "confidence_score": angka 0.0–1.0 menunjukkan tingkat keyakinan terhadap jawaban final.
+    - "force_optional_llm": true jika:
+        • Jawaban membutuhkan informasi spesifik yang tidak tertulis jelas di KNOWLEDGE CONTEXT.
+        • Pertanyaan menyangkut biaya tambahan, selisih harga, pengecualian paket, domain khusus (.co.id, dll), add-on, atau kondisi khusus.
+        • KNOWLEDGE CONTEXT terlalu umum untuk memastikan jawaban 100% akurat.
+    - false jika KNOWLEDGE CONTEXT sudah eksplisit dan pasti.
 
     =====================================================
     INPUT
@@ -426,12 +547,15 @@ def llm_validate_and_generate(
     {knowledge_context if knowledge_context else "(KOSONG)"}
 
     =====================================================
-    OUTPUT (JSON ONLY)
+    OUTPUT (WAJIB JSON ONLY)
     =====================================================
-
-    {
-    "response": "jawaban final yang singkat, natural, dan tervalidasi"
-    }
+    {{
+    "response": "jawaban final yang ringkas dan natural",
+    "category_product": null,
+    "knowledge_relevant": true,
+    "force_optional_llm": false,
+    "confidence_score": 0.0
+    }}
     """
 
     try:
@@ -450,52 +574,184 @@ def llm_validate_and_generate(
         )
 
         raw = resp.content[0].text.strip()
-        logger.debug(f"[LLM1 RAW OUTPUT] {raw[:300]}")
+        logger.debug(f"[LLM1 RAW LENGTH] {len(raw)}")
 
         parsed = safe_parse_json(raw)
         if not parsed or "response" not in parsed:
             logger.warning("[LLM1] Invalid JSON output, using raw response")
             logger.debug(f"[LLM1 RAW FALLBACK] {raw}")
             return {
-                "response": raw
+                "response": raw,
+                "category_product": "__PARSING_ERROR__",
+                "knowledge_relevant": False,
+                "confidence_score": 0.0
             }
         logger.debug("[LLM1] JSON parsed successfully")
         return {
-            "response": parsed.get("response", "")
+            "response": parsed.get("response", ""),
+            "category_product": parsed.get("category_product"),
+            "knowledge_relevant": parsed.get("knowledge_relevant", False),
+            "force_optional_llm": parsed.get("force_optional_llm", False),
+            "confidence_score": parsed.get("confidence_score", 0.0)
         }
     except Exception:
         logger.exception("[LLM1 ERROR] Claude validate+generate failed")
         raise
 
+def llm_optional_product_regenerate(
+    user_message,
+    user_intent,
+    context_messages,
+    category_product,
+    previous_response
+):
+    context = ""
+    if context_messages:
+        context = "\n".join(
+            f"{m['role']}: {m['content']}"
+            for m in context_messages[-9:]
+        )
+
+    product_knowledge = get_product_knowledge(category_product)
+
+    prompt = f"""
+    KAMU adalah Admin Marketing profesional.
+
+    Previous response TIDAK SESUAI dengan knowledge produk resmi.
+    Tugas kamu adalah MEMPERBAIKI jawaban tersebut.
+
+    =====================================================
+    PRODUK YANG WAJIB DIFOKUSKAN
+    =====================================================
+    {category_product}
+
+    =====================================================
+    KNOWLEDGE RESMI PRODUK
+    =====================================================
+    {product_knowledge}
+
+    =====================================================
+    PREVIOUS RESPONSE DARI LLM1 (SALAH / TIDAK SESUAI)
+    =====================================================
+    {previous_response}
+
+    =====================================================
+    ATURAN WAJIB
+    =====================================================
+
+    1. Abaikan informasi yang tidak ada dalam knowledge resmi.
+    2. Buat ulang jawaban agar:
+    - Sesuai 100% dengan knowledge resmi
+    - Tidak membahas produk lain
+    - Tidak menambah informasi di luar knowledge
+    3. Jangan mengarang harga, promo, atau detail teknis.
+    4. Jawaban singkat dan natural.
+    5. Tidak menggunakan tanda seru.
+    6. Maksimal 2 emoticon ringan.
+
+    =====================================================
+    INPUT TAMBAHAN
+    =====================================================
+
+    SUMMARY CONTEXT:
+    {context}
+
+    USER MESSAGE:
+    {user_message}
+
+    USER INTENT:
+    {user_intent}
+
+    =====================================================
+    OUTPUT (TEXT ONLY)
+    =====================================================
+    """
+
+    logger.debug(f"[OPTIONAL LLM] prompt_length={len(prompt)}")
+    logger.debug(f"[OPTIONAL LLM] category_product={category_product}")
+    logger.debug(f"[OPTIONAL LLM] knowledge_length={len(product_knowledge) if product_knowledge else 0}")
+
+    try:
+        resp = claude_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=600,
+            temperature=0.0,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        return resp.content[0].text.strip()
+
+    except Exception:
+        logger.exception("[LLM OPTIONAL ERROR]")
+        return None
+    
 def sanitize_llm_response(
     user_message: str,
     user_intent: str,
     context: str,
-    final_response_llm1: str
+    raw_response: str,
+    category_product=None
 ):
     logger.debug("[LLM2] Sanitizing response")
     logger.debug(f"[LLM2] user_intent={user_intent}")
-    logger.debug(f"[LLM2] LLM1_response_preview='{final_response_llm1[:200]}'")
+    logger.debug(f"[LLM2] LLM1_response_preview='{raw_response[:200]}'")
+
+    if category_product:
+        if not isinstance(category_product, list):
+            category_product = [category_product]
+
+        price_context = get_price_context(category_product)
+    else:
+        price_context = "Tidak ada produk terdeteksi"
+
+    logger.debug(f"[LLM2] category_product={category_product}")
+    logger.debug(f"[LLM2] price_context_length={len(price_context)}")
 
     prompt = f"""
-    Kamu adalah AI FILTER profesional.
+    Kamu adalah AI VALIDATOR & SANITIZER profesional.
+    Posisi kamu adalah FINAL GATE sebelum jawaban dikirim ke user.
 
-    Tugasmu:
-    - MENGANALISIS response dari LLM layer 1
-    - MENDETEKSI unsur sensitif
-    - MENGGANTI dengan placeholder
-    - TIDAK membuat jawaban atau kalimat baru
-    - TIDAK mengubah struktur kalimat
-    - HANYA mengganti bagian sensitif dengan placeholder yang sesuai
+    TUGAS UTAMA:
+    1) Validasi dan koreksi harga produk jika tidak sesuai dengan daftar harga resmi.
+    2) Sanitasi data sensitif yang mungkin masih muncul pada response dari PREVIOUS LAYER.
+
+    KAMU TIDAK BOLEH:
+    Membuat jawaban baru/Menambah kalimat baru/Mengubah struktur kalimat/Mengubah gaya bahasa/Melakukan parafrase.
+
+    KAMU HANYA BOLEH:
+    - Mengganti angka harga yang salah.
+    - Mengganti data sensitif dengan placeholder yang sesuai.
 
     ================================================
-    UNSUR SENSITIF (WAJIB DIGANTI)
+    ATURAN VALIDASI HARGA PRODUK
     ================================================
-    Aturan umum:
-    - Penggantian HANYA dilakukan jika teks secara eksplisit menyebut nama spesifik perusahaan internal berikut.
-    - Jangan mengganti kata umum seperti: "perusahaan", "company", "usaha", atau perusahaan milik klien.
-    - Jangan mengganti jika konteksnya sedang menanyakan bidang usaha klien.
-    - Jangan melakukan penggantian berdasarkan asumsi.
+
+    - CATEGORY_PRODUCT menunjukkan produk yang sedang dibahas.
+    - PRICE_CONTEXT adalah daftar harga resmi produk tersebut.
+    - Gunakan PRICE_CONTEXT sebagai satu-satunya referensi harga yang benar.
+    - Analisis teks pada FINAL RESPONSE (PREVIOUS LAYER).
+
+    Jika FINAL RESPONSE menyebut angka harga:
+    → Pastikan angka tersebut SAMA dengan harga resmi di PRICE_CONTEXT.
+    → Jika berbeda, GANTI hanya angka harga yang salah.
+    → Jangan mengubah kalimat lain.
+
+    Jika harga sudah benar:
+    → Jangan diubah.
+
+    Jika tidak ada harga disebut:
+    → Jangan menambahkan harga.
+
+    Jika CATEGORY_PRODUCT null atau kosong:
+    → Jangan lakukan validasi harga sama sekali.
+
+    ================================================
+    ATURAN SANITASI DATA SENSITIF
+    ================================================
+
+    Penggantian hanya dilakukan jika teks SECARA EKSPLISIT menyebut data internal berikut.
+    Jangan mengganti berdasarkan asumsi.
+    Jangan mengganti kata umum.
 
     1. Nama perusahaan internal
 
@@ -558,20 +814,28 @@ def sanitize_llm_response(
     KONTEKS:
     {context}
 
-    FINAL RESPONSE (LLM 1):
-    {final_response_llm1}
+    FINAL RESPONSE (PREVIOUS LAYER):
+    {raw_response}
+
+    CATEGORY PRODUCT:
+    {category_product}
+
+    PRICE_CONTEXT:
+    {price_context}
 
     ================================================
     OUTPUT (JSON ONLY)
     ================================================
     {{
     "response": "response hanya data sensitif yang diganti",
-    "sensitive_found": true/false
+    "sensitive_found": true/false,
+    "price_corrected": true/false
     }}
     """
-    try:
-        logger.debug("[LLM2] Calling GPT sanitize layer")
+    logger.debug(f"[LLM2] prompt_length={len(prompt)}")
+    logger.debug(f"[LLM2] raw_response_length={len(raw_response) if raw_response else 0}")
 
+    try:
         resp = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[{"role": "user", "content": prompt}],
@@ -581,45 +845,55 @@ def sanitize_llm_response(
         raw = resp.choices[0].message.content.strip()
         logger.debug(f"[LLM2 RAW OUTPUT] {raw[:300]}")
 
-        # ==========================
-        # EXTRACT JSON
-        # ==========================
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         if not match:
             logger.warning("[LLM2] No JSON detected, using LLM1 result")
             return {
-                "response": final_response_llm1
+                "response": raw_response,
+                "sensitive_found": False,
+                "price_corrected": False
             }
 
-        parsed = safe_parse_json(raw)
+        parsed = safe_parse_json(match.group(0))
         if not parsed:
-            return {"response": final_response_llm1}
+            logger.warning("[LLM2] JSON parse failed, fallback to LLM1")
+            return {
+                "response": raw_response,
+                "sensitive_found": False,
+                "price_corrected": False
+            }
 
         response_text = parsed.get("response")
         sensitive_found = parsed.get("sensitive_found", False)
+        price_corrected = parsed.get("price_corrected", False)
 
         logger.debug(f"[LLM2] sensitive_found={sensitive_found}")
+        logger.debug(f"[LLM2] price_corrected={price_corrected}")
 
         # ==========================
         # LOGIC UTAMA
         # ==========================
         if response_text:
-            # Kalau ada hasil sanitize → pakai hasil LLM2
             logger.debug("[LLM2] Returning sanitized response")
             return {
-                "response": response_text
+                "response": response_text,
+                "sensitive_found": sensitive_found,
+                "price_corrected": price_corrected
             }
 
-        # Kalau response kosong → fallback
         logger.warning("[LLM2] Response empty, fallback to LLM1")
         return {
-            "response": final_response_llm1
+            "response": raw_response,
+            "sensitive_found": False,
+            "price_corrected": False
         }
 
     except Exception:
         logger.exception("[LLM2 ERROR] Sanitize layer failed")
         return {
-            "response": final_response_llm1
+            "response": raw_response,
+            "sensitive_found": False,
+            "price_corrected": False
         }
 
 # =================================
@@ -922,104 +1196,149 @@ def generate_assistant_response(
     user_category=None,
     prev_node_id=None,
     assistant_category=None,
-    context_messages=None
+    context_messages=None,
+    session_category_product=None  
 ):
     user_vec = embed_text(user_message)
-
     best_user_node, metadata = iterative_node_search(
         user_vec,
         user_message,
-        user_category,
+        user_category,       
         prev_node_id,
-        assistant_category
+        assistant_category 
     )
 
-    # ==============================
-    # TIDAK ADA USER NODE
-    # ==============================
-    if not best_user_node:
+    # =========================================================
+    # DETERMINE KNOWLEDGE CONTEXT
+    # =========================================================
+    if best_user_node:
+        user_node_id = best_user_node[0]
+
+        knowledge_data = get_response_from_knowledge(
+            best_user_node_id=user_node_id,
+            top_5_user_nodes=metadata.get("top_5_user_nodes", [])
+        )
+
+        detected_intent = NODES.get(user_node_id, {}).get("intent", "")
+        knowledge_context = knowledge_data.get("knowledge_context", "")
+        assistant_node_id = knowledge_data.get("assistant_node_id")
+
+    else:
         detected_intent = user_intent
+        knowledge_context = ""
+        assistant_node_id = None
 
-        llm_result = llm_validate_and_generate(
-            user_message=user_message,
-            user_intent=detected_intent,
-            knowledge_context="",
-            context_messages=context_messages
-        )
-
-        # ============================================
-        # DEBUG: Log LLM1 result
-        # ============================================
-        logger.debug(f"[LLM1 RESULT] keys={llm_result.keys()}")
-        logger.debug(f"[LLM1 RESULT] response_preview={str(llm_result.get('response', ''))[:100]}")
-
-        raw_response = llm_result.get("response", "")
-
-        sanitized = sanitize_llm_response(
-            user_message=user_message,
-            user_intent=detected_intent,
-            context=" | ".join(m["content"] for m in context_messages) if context_messages else "",
-            final_response_llm1=raw_response
-        )
-
-        final_response = sanitized.get("response", raw_response)
-
-        # ============================================
-        # DEBUG: Log LLM2 result
-        # ============================================
-        logger.debug(f"[LLM2 RESULT] response_preview={str(final_response)[:100]}")
-
-        return {
-            "response": final_response,
-            "node_id": None,
-            "metadata": metadata
-        }
-
-    # ==============================
-    # ADA USER NODE
-    # ==============================
-    user_node_id = best_user_node[0]
-
-    knowledge_data = get_response_from_knowledge(
-        best_user_node_id=user_node_id,
-        top_5_user_nodes=metadata["top_5_user_nodes"]
-    )
-
+    # =========================================================
+    # CALL LLM1
+    # =========================================================
     llm_result = llm_validate_and_generate(
         user_message=user_message,
-        user_intent=NODES.get(user_node_id, {}).get("intent", ""),
-        knowledge_context=knowledge_data["knowledge_context"],
+        user_intent=detected_intent,
+        knowledge_context=knowledge_context,
         context_messages=context_messages
     )
 
-    # ============================================
-    # DEBUG: Log LLM1 result
-    # ============================================
     logger.debug(f"[LLM1 RESULT] keys={llm_result.keys()}")
-    logger.debug(f"[LLM1 RESULT] response_preview={str(llm_result.get('response', ''))[:100]}")
+    logger.debug(f"[LLM1 RESULT] response_preview={str(llm_result.get('response',''))[:100]}")
 
     raw_response = llm_result.get("response", "")
+    detected_category_product = llm_result.get("category_product")
 
-    # FINAL QUALITY CONTROL
+    # =========================================================
+    # PRODUCT MEMORY LOGIC
+    # =========================================================
+    if detected_category_product == "__PARSING_ERROR__":
+        # Parsing gagal → pakai memory lama
+        final_category_product = session_category_product
+
+    elif detected_category_product is None:
+        # Tidak ada produk baru → pertahankan memory lama
+        final_category_product = session_category_product
+
+    elif isinstance(detected_category_product, list):
+        final_category_product = detected_category_product
+
+    else:
+        # unexpected format → fallback aman
+        final_category_product = session_category_product
+
+    # =========================================================
+    # OPTIONAL CALL LLM PRODUCT-AWARE REGENERATE
+    # =========================================================
+    used_optional_llm = False
+    knowledge_relevant = llm_result.get("knowledge_relevant")
+    confidence_score = llm_result.get("confidence_score", 0)
+    force_optional_llm = llm_result.get("force_optional_llm", False)
+
+    logger.debug(
+        f"[LLM1 SELF-EVAL] knowledge_relevant={knowledge_relevant} | "
+        f"confidence_score={confidence_score} | "
+        f"force_optional_llm={force_optional_llm}"
+    )
+
+    if final_category_product and (
+        force_optional_llm
+        or knowledge_relevant is False
+        or confidence_score < 0.5
+    ):
+        logger.debug(
+            "[OPTIONAL LLM] Triggered by self-evaluation "
+            f"(confidence={confidence_score}, force_optional_llm={force_optional_llm})"
+        )
+
+        optional_response = llm_optional_product_regenerate(
+            user_message=user_message,
+            user_intent=detected_intent,
+            context_messages=context_messages,
+            category_product=final_category_product,
+            previous_response=raw_response
+        )
+
+        if optional_response:
+            raw_response = optional_response
+            used_optional_llm = True
+            logger.debug("[OPTIONAL LLM] Regeneration success")
+        else:
+            logger.debug("[OPTIONAL LLM] Regeneration failed, using LLM1 response")
+
+    # =========================================================
+    # CALL LLM2
+    # =========================================================
     sanitized = sanitize_llm_response(
         user_message=user_message,
-        user_intent=NODES.get(user_node_id, {}).get("intent", ""),
+        user_intent=detected_intent,
         context=" | ".join(m["content"] for m in context_messages) if context_messages else "",
-        final_response_llm1=raw_response
+        raw_response=raw_response,
+        category_product=final_category_product
+    )
+
+    logger.debug(
+        f"[LLM2 FLAGS] sensitive_found={sanitized.get('sensitive_found')} | "
+        f"price_corrected={sanitized.get('price_corrected')}"
     )
 
     final_response = sanitized.get("response", raw_response)
     final_response = final_response.replace("!", "")
 
-    # ============================================
-    # DEBUG: Log LLM2 result
-    # ============================================logger.debug(f"[LLM2 RESULT] applied_code_product={applied_code}")
     logger.debug(f"[LLM2 RESULT] response_preview={str(final_response)[:100]}")
-
+    logger.debug(f"[FINAL CATEGORY PRODUCT] {final_category_product}")
+    logger.debug(
+        f"[PIPELINE SUMMARY] "
+        f"LLM1 -> OPTIONAL({used_optional_llm}) -> LLM2 | "
+        f"confidence={confidence_score} | "
+        f"category={final_category_product}"
+    )
+    # =========================================================
+    # RETURN
+    # =========================================================
     return {
         "response": final_response,
-        "node_id": knowledge_data["assistant_node_id"],
-        "metadata": metadata
+        "node_id": assistant_node_id,
+        "metadata": metadata,
+        "category_product": final_category_product,
+        "knowledge_relevant": knowledge_relevant,
+        "confidence_score": confidence_score,
+        "used_optional_llm": used_optional_llm
     }
 
 # ======================
@@ -1039,7 +1358,7 @@ def chat_with_session(user_message, session_id, reset=False):
             max_messages=9
         )
 
-        # INTENT & CATEGORY (ONCE)
+        # INTENT & FLOW CATEGORY (ONCE)
         user_intent, user_category = call_intent_and_category(
             user_message,
             "user",
@@ -1047,65 +1366,111 @@ def chat_with_session(user_message, session_id, reset=False):
         )
 
         logger.debug(f"[INTENT] {user_intent}")
-        logger.debug(f"[CATEGORY] {user_category}")
+        logger.debug(f"[FLOW CATEGORY] {user_category}")
 
         if reset:
             prev_node_id = None
             assistant_category = user_category
-            session_data = {"history": []}
+            session_data = {
+                "history": [],
+                "category_product": []
+            }
             SESSION_STORE[session_id] = session_data
         else:
             prev_node_id = session_data.get("prev_node_id")
             assistant_category = session_data.get("assistant_category")
 
-        # SESSION CLEANUP
-        if len(SESSION_STORE) > SESSION_CLEANUP_THRESHOLD:
-            for key in list(SESSION_STORE.keys())[:10]:
-                del SESSION_STORE[key]
+            if "category_product" not in session_data:
+                session_data["category_product"] = []
 
+        # SESSION CLEANUP
         if len(SESSION_STORE) > SESSION_STORE_MAX_SIZE:
-            for key in list(SESSION_STORE.keys())[:10]:
+            logger.debug("[SESSION CLEANUP] Max size exceeded, trimming oldest sessions")
+
+            excess = len(SESSION_STORE) - SESSION_STORE_MAX_SIZE
+            for key in list(SESSION_STORE.keys())[:excess]:
                 del SESSION_STORE[key]
 
     # ======================
     # GENERATE RESPONSE
     # ======================
+    session_category_product = session_data.get("category_product")
+
     result = generate_assistant_response(
-        user_message,
+        user_message=user_message,
         user_intent=user_intent,
         user_category=user_category,
         prev_node_id=prev_node_id,
         assistant_category=assistant_category,
-        context_messages=context_messages
+        context_messages=context_messages,
+        session_category_product=session_category_product
     )
 
-    final_response = result["response"]
+    final_response = result.get("response", "")
     assistant_node_id = result.get("node_id")
     metadata = result.get("metadata", {})
+    detected_category_product = result.get("category_product")
+    knowledge_relevant = result.get("knowledge_relevant")
+    confidence_score = result.get("confidence_score")
+    used_optional_llm = result.get("used_optional_llm")
+
+    assistant_node = NODES.get(assistant_node_id, {}) if assistant_node_id else {}
+
+    # =================
+    # UPDATE SESSION 
+    # =================
+    with SESSION_LOCK:
+
+        history = session_data.get("history", [])
+        history.append({"role": "user", "content": user_message})
+        history.append({"role": "assistant", "content": final_response})
+
+        session_data["history"] = history[-9:]
+        session_data["prev_node_id"] = assistant_node_id
+        session_data["assistant_category"] = assistant_node.get("category") or user_category
+
+        # =====================================
+        # STATE MEMORY CATEGORY PRODUCT
+        # =====================================
+        last_category_product = session_data.get("category_product", [])
+
+        if detected_category_product == "__PARSING_ERROR__":
+            session_data["category_product"] = last_category_product
+        elif detected_category_product:
+            # Ada produk baru terdeteksi
+            session_data["category_product"] = detected_category_product
+        else:
+            # Tidak ada produk baru → pertahankan memory lama
+            session_data["category_product"] = last_category_product
+
+        logger.debug(
+            f"[PRODUCT MEMORY] detected={detected_category_product} | "
+            f"previous={last_category_product} | "
+            f"final={session_data.get('category_product')}"
+        )
+        SESSION_STORE[session_id] = session_data
 
     # ======================
     # DEBUG INFO
     # ======================
-    assistant_node = NODES.get(assistant_node_id, {})
     debug_info = {
         "user_intent": user_intent,
-        "user_category": user_category,
+        "flow_category": user_category,
 
         # ROUTING
         "match_type": metadata.get("best_type"),
         "best_similarity": round(metadata.get("best_sim", 0), 3),
         "best_user_node_id": metadata.get("best_user_node_id"),
-
-        # TOP 5 USER NODE AS KNOWLEDGE SOURCE
         "top_5_user_nodes": metadata.get("top_5_user_nodes", []),
 
         # RESULT
-        "selected_user_node": metadata.get("best_user_node_id")
-        if metadata.get("top_5_user_nodes") else None,
-
         "assistant_node_id": assistant_node_id,
         "assistant_intent": assistant_node.get("intent"),
-        "assistant_category": assistant_node.get("category") or user_category,
+        "assistant_flow_category": assistant_node.get("category") or user_category,
+
+        # CATEGORY PRODUCT
+        "detected_category_product": detected_category_product,
+        "session_category_product": session_data.get("category_product"),
 
         # COUNTS
         "flow_candidates_count": metadata.get("flow_count"),
@@ -1115,26 +1480,17 @@ def chat_with_session(user_message, session_id, reset=False):
         "context_summary": " | ".join(
             f"{m['role']}: {m['content']}"
             for m in context_messages[-9:]
-        ) if context_messages else None
+        ) if context_messages else None,
+
+        # LLM SELF EVALUATION
+        "knowledge_relevant": knowledge_relevant,
+        "confidence_score": confidence_score,
+        "used_optional_llm": used_optional_llm,
     }
-
-    # ======================
-    # UPDATE SESSION
-    # ======================
-    with SESSION_LOCK:
-        history = session_data.get("history", [])
-
-        history.append({"role": "user", "content": user_message})
-        history.append({"role": "assistant", "content": final_response})
-
-        session_data["history"] = history[-9:]
-        session_data["prev_node_id"] = assistant_node_id
-        session_data["assistant_category"] = assistant_node.get("category") or user_category
-
-        SESSION_STORE[session_id] = session_data
 
     logger.debug(f"[FINAL RESPONSE] {final_response}")
     logger.debug(f"[ASSISTANT NODE ID] {assistant_node_id}")
+    logger.debug(f"[SESSION CATEGORY PRODUCT] {session_data.get('category_product')}")
     logger.debug(f"[SESSION END] session_id={session_id}")
 
     return {

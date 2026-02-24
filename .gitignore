@@ -3,3 +3,8 @@ output/embeddings.db
 output/*
 /output/*
 .env
+/venv
+/__pycache__
+app.log
+*.log
+output.zip

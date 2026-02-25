@@ -8,15 +8,20 @@ from flask import Flask, request, jsonify
 import pandas as pd
 import requests
 from openai import OpenAI
+from dotenv import load_dotenv
 from collections import OrderedDict
 import traceback
 import os
 import json
 import threading
 import sqlite3
+load_dotenv()
 
+openai_api_key = os.getenv("OPENAI_API_KEY")
+if not openai_api_key:
+    raise ValueError("OPENAI_API_KEY tidak ditemukan di environment variable")
 client = OpenAI(
-    api_key="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"
+    api_key=openai_api_key
 )
 app = Flask(__name__)
 
@@ -263,8 +268,7 @@ def run_pipeline():
 # ==========================================================================================================
 # ==========================================================================================================
 
-from response_claude import chat_with_session, load_flow_and_embeddings
-
+from response_claude import NODE_EMB, NODES, chat_with_session, load_flow_and_embeddings
 load_flow_and_embeddings() 
 
 # ==========================

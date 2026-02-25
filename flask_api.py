@@ -280,80 +280,160 @@ def init_analysis_db():
     os.makedirs("output", exist_ok=True)
     db = get_db("output/analysis.db")
     cur = db.cursor()
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS chat_analysis (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+
             session_id TEXT,
             user_message TEXT,
             response TEXT,
+
+            -- INTENT & FLOW
             user_intent TEXT,
             user_category TEXT,
+
             match_type TEXT,
             best_similarity REAL,
             best_user_node_id TEXT,
             top_5_user_nodes TEXT,
+
             assistant_node_id TEXT,
             assistant_intent TEXT,
             assistant_category TEXT,
+                
+            knowledge_context TEXT,
+
             flow_candidates_count INTEGER,
             global_candidates_count INTEGER,
+
             context_summary TEXT,
+
+            -- PRODUCT MEMORY
+            detected_category_product TEXT,
+            session_category_product TEXT,
+
+            -- LLM SELF EVAL
+            knowledge_relevant INTEGER,
+            confidence_score REAL,
+            used_optional_llm INTEGER,
+
+            -- SANITIZE FLAGS
+            sensitive_found INTEGER,
+            price_corrected INTEGER,
+
+            -- PROMPTS
             llm1_prompt TEXT,
-            llm2_prompt TEXT
+            optional_llm_prompt TEXT,
+            llm2_prompt TEXT,
+            
+            -- LLM OUTPUT
+            llm1_raw_output TEXT,
+            optional_llm_raw_output TEXT,
+            llm2_raw_output TEXT
         )
     """)
+
     db.commit()
-    
-    try:
-        cur.execute("ALTER TABLE chat_analysis ADD COLUMN llm1_prompt TEXT")
-        cur.execute("ALTER TABLE chat_analysis ADD COLUMN llm2_prompt TEXT")
-        db.commit()
-    except Exception:
-        pass
-        
     db.close()
 
 def log_analysis_data(session_id, user_message, response, debug_info):
     try:
         db = get_db("output/analysis.db")
         cur = db.cursor()
-        
-        user_intent = debug_info.get("user_intent", "")
-        user_category = debug_info.get("user_category", "")
-        match_type = debug_info.get("match_type", "")
-        best_similarity = debug_info.get("best_similarity", 0.0)
-        best_user_node_id = debug_info.get("best_user_node_id", "")
-        
-        top_5_user_nodes = debug_info.get("top_5_user_nodes", [])
-        top_5_json = json.dumps(top_5_user_nodes) if top_5_user_nodes else "[]"
-        
-        assistant_node_id = debug_info.get("assistant_node_id", "")
-        assistant_intent = debug_info.get("assistant_intent", "")
-        assistant_category = debug_info.get("assistant_category", "")
-        flow_candidates_count = debug_info.get("flow_candidates_count", 0)
-        global_candidates_count = debug_info.get("global_candidates_count", 0)
-        context_summary = debug_info.get("context_summary", "")
-        llm1_prompt = debug_info.get("llm1_prompt", "")
-        llm2_prompt = debug_info.get("llm2_prompt", "")
 
         cur.execute("""
             INSERT INTO chat_analysis (
-                session_id, user_message, response, user_intent, user_category,
-                match_type, best_similarity, best_user_node_id, top_5_user_nodes,
-                assistant_node_id, assistant_intent, assistant_category,
-                flow_candidates_count, global_candidates_count, context_summary,
-                llm1_prompt, llm2_prompt
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                session_id,
+                user_message,
+                response,
+
+                user_intent,
+                user_category,
+
+                match_type,
+                best_similarity,
+                best_user_node_id,
+                top_5_user_nodes,
+
+                assistant_node_id,
+                assistant_intent,
+                assistant_category,
+
+                knowledge_context,
+                
+                flow_candidates_count,
+                global_candidates_count,
+
+                context_summary,
+
+                detected_category_product,
+                session_category_product,
+
+                knowledge_relevant,
+                confidence_score,
+                used_optional_llm,
+
+                sensitive_found,
+                price_corrected,
+
+                llm1_prompt,
+                optional_llm_prompt,
+                llm2_prompt,
+                
+                llm1_raw_output,
+                optional_llm_raw_output,
+                llm2_raw_output
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            session_id, user_message, response, user_intent, user_category,
-            match_type, best_similarity, best_user_node_id, top_5_json,
-            assistant_node_id, assistant_intent, assistant_category,
-            flow_candidates_count, global_candidates_count, context_summary,
-            llm1_prompt, llm2_prompt
+
+            session_id,
+            user_message,
+            response,
+
+            debug_info.get("user_intent"),
+            debug_info.get("user_category"),
+
+            debug_info.get("match_type"),
+            debug_info.get("best_similarity"),
+            debug_info.get("best_user_node_id"),
+            json.dumps(debug_info.get("top_5_user_nodes", [])),
+
+            debug_info.get("assistant_node_id"),
+            debug_info.get("assistant_intent"),
+            debug_info.get("assistant_category"),
+
+            debug_info.get("knowledge_context"),
+
+            debug_info.get("flow_candidates_count"),
+            debug_info.get("global_candidates_count"),
+
+            debug_info.get("context_summary"),
+
+            json.dumps(debug_info.get("detected_category_product")),
+            json.dumps(debug_info.get("session_category_product")),
+
+            int(bool(debug_info.get("knowledge_relevant"))),
+            debug_info.get("confidence_score"),
+            int(bool(debug_info.get("used_optional_llm"))),
+
+            int(bool(debug_info.get("sensitive_found"))),
+            int(bool(debug_info.get("price_corrected"))),
+
+            debug_info.get("llm1_prompt"),
+            debug_info.get("optional_llm_prompt"),
+            debug_info.get("llm2_prompt"),
+
+            debug_info.get("llm1_raw_output"),
+            debug_info.get("optional_llm_raw_output"),
+            debug_info.get("llm2_raw_output")
         ))
+
         db.commit()
         db.close()
+
     except Exception as e:
         import traceback
         print(f"[ERROR] Failed to log analysis data: {e}")

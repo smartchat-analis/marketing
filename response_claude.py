@@ -445,38 +445,54 @@ def llm_validate_and_generate(
 
     prompt = f"""
     Kamu adalah Admin Marketing WhatsApp representatif sebuah agency digital.
-    Jawab pertanyaan user dengan ringkas, profesional, natural, dan tidak seperti bot.
+    Jawab pertanyaan user dengan profesional, natural, jelas, dan tidak terdengar seperti bot.
 
-    TUGAS UTAMA:
+    Gunakan gaya bahasa yang hangat, sopan, dan to the point.
+    Boleh menggunakan enter atau bullet agar pesan mudah dibaca dan tidak menumpuk dalam satu paragraf.
+
+    =====================================================
+    IDENTITAS ADMIN
+    =====================================================
+
+    Jika klien MENANYAKAN nama kamu:
+    - Jika konteks berasal dari perusahaan EDA atau Asain → jawab nama: Aisyah
+    - Jika konteks berasal dari perusahaan EBYB → jawab nama: Alesha
+    - Jika asal perusahaan tidak diketahui → perkenalkan diri sebagai admin marketing tanpa menyebut nama
+
+    Jika tidak ditanya nama → jangan memperkenalkan diri.
+    Dilarang menyebut nama di luar aturan tersebut.
+
+    =====================================================
+    TUGAS UTAMA
+    =====================================================
+
     1. Validasi dan olah KNOWLEDGE CONTEXT yang sudah dipilih sistem.
-    2. Jawab secukupnya sesuai pertanyaan terakhir user.
-    3. Jangan overexplain, jangan seperti FAQ generator.
-    4. Tetap terdengar seperti admin manusia.
-
-    =====================================================
-    ATURAN MENJAWAB
-    =====================================================
-    1. Prioritaskan KNOWLEDGE CONTEXT sebagai referensi utama.
     2. Gunakan SUMMARY CONTEXT sebagai riwayat percakapan.
-    3. Jika knowledge sebagian tidak relevan (retrieval mismatch), ambil bagian yang relevan saja.
-    4. Jika knowledge kosong atau tidak relevan:
-    - Boleh gunakan pengetahuan umum tentang digital marketing.
-    - TETAPI dilarang keras mengarang informasi krusial perusahaan
-        (nama paket, harga spesifik, promo, syarat khusus, kontak, alamat, rekening).
+    3. Jawab fokus pada pertanyaan terakhir user.
+    4. Jangan overexplain.
+    5. Jangan terdengar seperti FAQ generator.
 
-    Jika user menanyakan info krusial yang tidak ada di knowledge:
-    Gunakan respon ini:
+    Jika knowledge sebagian tidak relevan, ambil bagian yang relevan saja.
+
+    Jika knowledge kosong atau tidak relevan:
+    - Boleh gunakan pengetahuan umum digital marketing.
+    - Dilarang mengarang informasi krusial perusahaan (nama paket, harga spesifik, promo, syarat khusus, kontak, alamat, rekening).
+
+    Jika user menanyakan info krusial yang tidak ada di knowledge, gunakan respon koordinasi tim seperti ini:
     "Terima kasih atas pertanyaannya😊 Untuk memastikan informasi yang akurat, izin kami koordinasikan terlebih dahulu dengan tim terkait ya. Nanti akan segera kami informasikan kembali🙏"
 
     =====================================================
-    BATASAN JAWABAN
+    GAYA JAWABAN
     =====================================================
-    - Default 2–5 kalimat.
-    - Jangan kirim list panjang kecuali diminta.
-    - Jangan jelaskan semua paket jika hanya ditanya satu.
+
+    - Natural seperti admin manusia.
+    - Tidak kaku.
+    - Tidak terlalu formal.
+    - Tidak promosi agresif.
+    - Tidak menanyakan ulang hal/info yang sudah jelas disampaikan oleh user
     - Maksimal 2 emoticon ringan.
-    - Tidak boleh menggunakan tanda seru (!).
-    - Jangan gunakan markdown seperti **bold**, gunakan format WhatsApp jika perlu (*contoh*).
+    - Tanda seru tidak boleh digunakan. Jika muncul, ubah menjadi titik.
+    - Jangan gunakan markdown seperti **bold**. Gunakan format WhatsApp jika perlu: *contoh*.
 
     =====================================================
     DETEKSI CATEGORY PRODUCT (WAJIB)
@@ -492,7 +508,7 @@ def llm_validate_and_generate(
     only design, hapus copyright, beli putus, custom website)
 
     2. SEO  
-    (optimasi website agar muncul di hasil pencarian Google, peningkatan ranking keyword, riset keyword, on-page SEO, technical SEO, optimasi konten,
+    (optimasi website agar muncul di hasil pencarian Google, peningkatan ranking google, riset keyword, on-page SEO, technical SEO, optimasi konten,
     laporan performa, biaya & paket SEO)
 
     3. GOOGLE_ADS  
@@ -511,8 +527,8 @@ def llm_validate_and_generate(
     (artikel ID/EN, video promosi, desain banner, kartu nama, desain logo, LinkTree, proposal bisnis, promosi status WA, pembuatan Google Bisnis/Google Maps)
     
     Aturan:
-    - Jika eksplisit menyebut sebuah produk misalnya website → WAJIB ["WEBSITE"]
-    - Jika lebih dari satu → kembalikan dalam ARRAY contoh ["WEBSITE", "SEO"]
+    - Jika eksplisit menyebut produk → wajib array sesuai produk, contoh ["WEBSITE"]
+    - Jika lebih dari satu → contoh ["WEBSITE", "SEO"]
     - Jika hanya greeting tanpa konteks → null
     - Dilarang membuat kategori baru
     - Dilarang mengembalikan array kosong []
@@ -594,7 +610,7 @@ def llm_validate_and_generate(
             "force_optional_llm": parsed.get("force_optional_llm", False),
             "confidence_score": parsed.get("confidence_score", 0.0),
             "prompt": prompt,
-            "raw_output": raw
+            "raw_output": parsed.get("response", raw)
         }
     except Exception:
         logger.exception("[LLM1 ERROR] Claude validate+generate failed")
@@ -617,10 +633,10 @@ def llm_optional_product_regenerate(
     product_knowledge = get_product_knowledge(category_product)
 
     prompt = f"""
-    KAMU adalah Admin Marketing profesional.
+    Kamu adalah Admin Marketing WhatsApp representatif sebuah agency digital.
 
-    Previous response TIDAK SESUAI dengan knowledge produk resmi.
-    Tugas kamu adalah MEMPERBAIKI jawaban tersebut.
+    Previous response TIDAK sesuai dengan knowledge produk resmi.
+    Tugas kamu adalah memperbaiki jawaban tersebut agar sepenuhnya akurat dan tetap terdengar natural seperti admin manusia.
 
     =====================================================
     PRODUK YANG WAJIB DIFOKUSKAN
@@ -638,21 +654,6 @@ def llm_optional_product_regenerate(
     {previous_response}
 
     =====================================================
-    ATURAN WAJIB
-    =====================================================
-
-    1. Abaikan informasi yang tidak ada dalam knowledge resmi.
-    2. Buat ulang jawaban agar:
-    - Sesuai 100% dengan knowledge resmi
-    - Tidak membahas produk lain
-    - Tidak menambah informasi di luar knowledge
-    3. Jangan mengarang harga, promo, atau detail teknis.
-    4. Jawaban singkat dan natural.
-    5. Maksimal 5 kalimat.
-    6. Tidak menggunakan tanda seru.
-    7. Maksimal 2 emoticon ringan.
-
-    =====================================================
     INPUT TAMBAHAN
     =====================================================
 
@@ -666,8 +667,26 @@ def llm_optional_product_regenerate(
     {user_intent}
 
     =====================================================
-    OUTPUT (TEXT ONLY)
+    ATURAN WAJIB
     =====================================================
+
+    1. Gunakan hanya informasi yang ada dalam knowledge resmi.
+    2. Abaikan informasi yang tidak ada dalam knowledge.
+    3. Jangan menambah asumsi, harga, promo, atau detail teknis di luar knowledge.
+    4. Fokus hanya pada produk yang ditentukan.
+    5. Jangan membahas produk lain.
+    6. Jawaban harus natural, profesional, dan tidak terdengar seperti bot.
+    7. Tidak boleh menggunakan tanda seru. Jika muncul, ubah menjadi titik.
+    8. Maksimal 2 emoticon ringan.
+    9. Boleh menggunakan enter atau bullet agar pesan mudah dibaca.
+
+    Jika knowledge tidak cukup untuk menjawab secara pasti, gunakan respon koordinasi tim secara natural.
+
+    =====================================================
+    OUTPUT
+    =====================================================
+
+    Berikan jawaban final dalam bentuk teks saja.
     """
 
     logger.debug(f"[OPTIONAL LLM] prompt_length={len(prompt)}")
@@ -700,7 +719,7 @@ def sanitize_llm_response(
 ):
     logger.debug("[LLM2] Sanitizing response")
     logger.debug(f"[LLM2] user_intent={user_intent}")
-    logger.debug(f"[LLM2] LLM1_response_preview='{raw_response[:200]}'")
+    logger.debug(f"[LLM2] Previouse_LLM_response_preview='{raw_response[:200]}'")
 
     if category_product:
         if not isinstance(category_product, list):
@@ -886,7 +905,7 @@ def sanitize_llm_response(
                 "sensitive_found": sensitive_found,
                 "price_corrected": price_corrected,
                 "prompt": prompt,
-                "raw_output": raw
+                "raw_output": response_text
             }
 
         logger.warning("[LLM2] Response empty, fallback to LLM1")
@@ -1252,8 +1271,8 @@ def generate_assistant_response(
     raw_response = llm_result.get("response", "")
     detected_category_product = llm_result.get("category_product")
     llm1_prompt = llm_result.get("prompt")
-    llm1_raw_output = llm_result.get("raw_output")
-    optional_llm_raw_output = None
+    llm1_output = llm_result.get("raw_output")
+    optional_llm_output = None
 
     # =========================================================
     # PRODUCT MEMORY LOGIC
@@ -1300,7 +1319,7 @@ def generate_assistant_response(
         if optional_response:
             raw_response = optional_response.get("response")
             optional_llm_prompt = optional_response.get("prompt")
-            optional_llm_raw_output = optional_response.get("raw_output")
+            optional_llm_output = optional_response.get("raw_output")
             used_optional_llm = True
 
     # =========================================================
@@ -1322,9 +1341,9 @@ def generate_assistant_response(
     )
 
     final_response = sanitized.get("response", raw_response)
-    final_response = final_response.replace("!", "")
+    final_response = final_response.replace("!", ".")
     llm2_prompt = sanitized.get("prompt")
-    llm2_raw_output = sanitized.get("raw_output")
+    llm2_output = sanitized.get("raw_output")
     
 
     logger.debug(f"[LLM2 RESULT] response_preview={str(final_response)[:100]}")
@@ -1352,9 +1371,9 @@ def generate_assistant_response(
         "knowledge_context": knowledge_context,
         "sensitive_found": sanitized.get("sensitive_found"),
         "price_corrected": sanitized.get("price_corrected"),
-        "llm1_raw_output": llm1_raw_output,
-        "optional_llm_raw_output": optional_llm_raw_output,
-        "llm2_raw_output": llm2_raw_output
+        "llm1_output": llm1_output,
+        "optional_llm_output": optional_llm_output,
+        "llm2_output": llm2_output
     }
 
 # ======================
@@ -1433,9 +1452,9 @@ def chat_with_session(user_message, session_id, reset=False):
     llm1_prompt = result.get("llm1_prompt")
     optional_llm_prompt = result.get("optional_llm_prompt")
     llm2_prompt = result.get("llm2_prompt")
-    llm1_raw_output = result.get("llm1_raw_output")
-    optional_llm_raw_output = result.get("optional_llm_raw_output")
-    llm2_raw_output = result.get("llm2_raw_output")
+    llm1_output = result.get("llm1_output")
+    optional_llm_output = result.get("optional_llm_output")
+    llm2_output = result.get("llm2_output")
     knowledge_context = result.get("knowledge_context")
     sensitive_found = result.get("sensitive_found")
     price_corrected = result.get("price_corrected")
@@ -1521,9 +1540,9 @@ def chat_with_session(user_message, session_id, reset=False):
         "llm2_prompt": llm2_prompt,
 
         # LLM OUTPUT
-        "llm1_raw_output": llm1_raw_output,
-        "optional_llm_raw_output": optional_llm_raw_output,
-        "llm2_raw_output": llm2_raw_output,
+        "llm1_output": llm1_output,
+        "optional_llm_output": optional_llm_output,
+        "llm2_output": llm2_output,
 
         #SANITIZE FLAGS
         "sensitive_found": sensitive_found,

@@ -329,9 +329,9 @@ def init_analysis_db():
             llm2_prompt TEXT,
             
             -- LLM OUTPUT
-            llm1_raw_output TEXT,
-            optional_llm_raw_output TEXT,
-            llm2_raw_output TEXT
+            llm1_output TEXT,
+            optional_llm_output TEXT,
+            llm2_output TEXT
         )
     """)
 
@@ -382,9 +382,9 @@ def log_analysis_data(session_id, user_message, response, debug_info):
                 optional_llm_prompt,
                 llm2_prompt,
                 
-                llm1_raw_output,
-                optional_llm_raw_output,
-                llm2_raw_output
+                llm1_output,
+                optional_llm_output,
+                llm2_output
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
@@ -426,9 +426,9 @@ def log_analysis_data(session_id, user_message, response, debug_info):
             debug_info.get("optional_llm_prompt"),
             debug_info.get("llm2_prompt"),
 
-            debug_info.get("llm1_raw_output"),
-            debug_info.get("optional_llm_raw_output"),
-            debug_info.get("llm2_raw_output")
+            debug_info.get("llm1_output"),
+            debug_info.get("optional_llm_output"),
+            debug_info.get("llm2_output")
         ))
 
         db.commit()
@@ -475,5 +475,5 @@ def chat():
 # RUN
 # ======================
 if __name__ == "__main__":
-    print("Running Flask API on http://127.0.0.1:5000")
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    print("Running Flask API on http://127.0.0.1:8000")
+    app.run(host="127.0.0.1", port=8000, debug=False)

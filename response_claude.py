@@ -37,7 +37,6 @@ FLOW_PATH = "output/global_flow.db"
 NODE_EMB_PATH = "output/embeddings.db"
 EMBEDDING_CACHE = OrderedDict() 
 EMBEDDING_CACHE_MAX_SIZE = 1000
-SESSION_CLEANUP_THRESHOLD = 100
 SESSION_STORE_MAX_SIZE = 500
 openai_api_key = os.getenv("OPENAI_API_KEY")
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -593,7 +592,9 @@ def llm_validate_and_generate(
             "category_product": parsed.get("category_product"),
             "knowledge_relevant": parsed.get("knowledge_relevant", False),
             "force_optional_llm": parsed.get("force_optional_llm", False),
-            "confidence_score": parsed.get("confidence_score", 0.0)
+            "confidence_score": parsed.get("confidence_score", 0.0),
+            "prompt": prompt,
+            "raw_output": raw
         }
     except Exception:
         logger.exception("[LLM1 ERROR] Claude validate+generate failed")
@@ -680,9 +681,12 @@ def llm_optional_product_regenerate(
             temperature=0.0,
             messages=[{"role": "user", "content": prompt}]
         )
-
-        return resp.content[0].text.strip()
-
+        raw = resp.content[0].text.strip()
+        return {
+            "response": raw,
+            "prompt": prompt,
+            "raw_output": raw
+        }
     except Exception:
         logger.exception("[LLM OPTIONAL ERROR]")
         return None
@@ -880,7 +884,9 @@ def sanitize_llm_response(
             return {
                 "response": response_text,
                 "sensitive_found": sensitive_found,
-                "price_corrected": price_corrected
+                "price_corrected": price_corrected,
+                "prompt": prompt,
+                "raw_output": raw
             }
 
         logger.warning("[LLM2] Response empty, fallback to LLM1")
@@ -1245,6 +1251,9 @@ def generate_assistant_response(
 
     raw_response = llm_result.get("response", "")
     detected_category_product = llm_result.get("category_product")
+    llm1_prompt = llm_result.get("prompt")
+    llm1_raw_output = llm_result.get("raw_output")
+    optional_llm_raw_output = None
 
     # =========================================================
     # PRODUCT MEMORY LOGIC
@@ -1268,25 +1277,17 @@ def generate_assistant_response(
     # OPTIONAL CALL LLM PRODUCT-AWARE REGENERATE
     # =========================================================
     used_optional_llm = False
-    knowledge_relevant = llm_result.get("knowledge_relevant")
-    confidence_score = llm_result.get("confidence_score", 0)
-    force_optional_llm = llm_result.get("force_optional_llm", False)
+    optional_llm_prompt = None
 
-    logger.debug(
-        f"[LLM1 SELF-EVAL] knowledge_relevant={knowledge_relevant} | "
-        f"confidence_score={confidence_score} | "
-        f"force_optional_llm={force_optional_llm}"
-    )
+    knowledge_relevant = llm_result.get("knowledge_relevant")
+    confidence_score = float(llm_result.get("confidence_score", 0.0))
+    force_optional_llm = llm_result.get("force_optional_llm", False)
 
     if final_category_product and (
         force_optional_llm
         or knowledge_relevant is False
         or confidence_score < 0.5
     ):
-        logger.debug(
-            "[OPTIONAL LLM] Triggered by self-evaluation "
-            f"(confidence={confidence_score}, force_optional_llm={force_optional_llm})"
-        )
 
         optional_response = llm_optional_product_regenerate(
             user_message=user_message,
@@ -1297,15 +1298,16 @@ def generate_assistant_response(
         )
 
         if optional_response:
-            raw_response = optional_response
+            raw_response = optional_response.get("response")
+            optional_llm_prompt = optional_response.get("prompt")
+            optional_llm_raw_output = optional_response.get("raw_output")
             used_optional_llm = True
-            logger.debug("[OPTIONAL LLM] Regeneration success")
-        else:
-            logger.debug("[OPTIONAL LLM] Regeneration failed, using LLM1 response")
 
     # =========================================================
     # CALL LLM2
     # =========================================================
+    raw_response = str(raw_response) if raw_response is not None else ""
+
     sanitized = sanitize_llm_response(
         user_message=user_message,
         user_intent=detected_intent,
@@ -1321,6 +1323,9 @@ def generate_assistant_response(
 
     final_response = sanitized.get("response", raw_response)
     final_response = final_response.replace("!", "")
+    llm2_prompt = sanitized.get("prompt")
+    llm2_raw_output = sanitized.get("raw_output")
+    
 
     logger.debug(f"[LLM2 RESULT] response_preview={str(final_response)[:100]}")
     logger.debug(f"[FINAL CATEGORY PRODUCT] {final_category_product}")
@@ -1340,7 +1345,16 @@ def generate_assistant_response(
         "category_product": final_category_product,
         "knowledge_relevant": knowledge_relevant,
         "confidence_score": confidence_score,
-        "used_optional_llm": used_optional_llm
+        "used_optional_llm": used_optional_llm,
+        "llm1_prompt": llm1_prompt,
+        "optional_llm_prompt": optional_llm_prompt,
+        "llm2_prompt": llm2_prompt,
+        "knowledge_context": knowledge_context,
+        "sensitive_found": sanitized.get("sensitive_found"),
+        "price_corrected": sanitized.get("price_corrected"),
+        "llm1_raw_output": llm1_raw_output,
+        "optional_llm_raw_output": optional_llm_raw_output,
+        "llm2_raw_output": llm2_raw_output
     }
 
 # ======================
@@ -1405,16 +1419,27 @@ def chat_with_session(user_message, session_id, reset=False):
         prev_node_id=prev_node_id,
         assistant_category=assistant_category,
         context_messages=context_messages,
-        session_category_product=session_category_product
+        session_category_product=session_category_product,
     )
 
     final_response = result.get("response", "")
     assistant_node_id = result.get("node_id")
     metadata = result.get("metadata", {})
+    metadata = metadata or {} 
     detected_category_product = result.get("category_product")
     knowledge_relevant = result.get("knowledge_relevant")
     confidence_score = result.get("confidence_score")
     used_optional_llm = result.get("used_optional_llm")
+    llm1_prompt = result.get("llm1_prompt")
+    optional_llm_prompt = result.get("optional_llm_prompt")
+    llm2_prompt = result.get("llm2_prompt")
+    llm1_raw_output = result.get("llm1_raw_output")
+    optional_llm_raw_output = result.get("optional_llm_raw_output")
+    llm2_raw_output = result.get("llm2_raw_output")
+    knowledge_context = result.get("knowledge_context")
+    sensitive_found = result.get("sensitive_found")
+    price_corrected = result.get("price_corrected")
+    
 
     assistant_node = NODES.get(assistant_node_id, {}) if assistant_node_id else {}
 
@@ -1457,7 +1482,7 @@ def chat_with_session(user_message, session_id, reset=False):
     # ======================
     debug_info = {
         "user_intent": user_intent,
-        "flow_category": user_category,
+        "user_category": user_category,
 
         # ROUTING
         "match_type": metadata.get("best_type"),
@@ -1468,7 +1493,7 @@ def chat_with_session(user_message, session_id, reset=False):
         # RESULT
         "assistant_node_id": assistant_node_id,
         "assistant_intent": assistant_node.get("intent"),
-        "assistant_flow_category": assistant_node.get("category") or user_category,
+        "assistant_category": assistant_node.get("category") or user_category,
 
         # CATEGORY PRODUCT
         "detected_category_product": detected_category_product,
@@ -1483,11 +1508,26 @@ def chat_with_session(user_message, session_id, reset=False):
             f"{m['role']}: {m['content']}"
             for m in context_messages[-9:]
         ) if context_messages else None,
+        "knowledge_context": knowledge_context,
 
         # LLM SELF EVALUATION
         "knowledge_relevant": knowledge_relevant,
         "confidence_score": confidence_score,
         "used_optional_llm": used_optional_llm,
+ 
+        # LLM PROMPT
+        "llm1_prompt": llm1_prompt,
+        "optional_llm_prompt": optional_llm_prompt,
+        "llm2_prompt": llm2_prompt,
+
+        # LLM OUTPUT
+        "llm1_raw_output": llm1_raw_output,
+        "optional_llm_raw_output": optional_llm_raw_output,
+        "llm2_raw_output": llm2_raw_output,
+
+        #SANITIZE FLAGS
+        "sensitive_found": sensitive_found,
+        "price_corrected": price_corrected
     }
 
     logger.debug(f"[FINAL RESPONSE] {final_response}")

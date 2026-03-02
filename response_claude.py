@@ -150,6 +150,11 @@ def load_flow_and_embeddings():
 def normalize_text(t: str):
     return re.sub(r"\s+", " ", t.lower().strip())
 
+def trim_text_by_char(text, max_chars=15000):
+    if not text:
+        return text
+    return text[:max_chars]
+
 def cosine_similarity(vecA, vecB):
     if len(vecA) != len(vecB):
         return 0.0
@@ -318,28 +323,6 @@ def get_product_knowledge(category_product_list):
 
     return "\n\n".join(knowledge_chunks)
 
-# ============================
-# KNOWLEDGE MISMATCH DETECTOR
-# ============================
-def is_knowledge_mismatch(category_product, knowledge_context):
-    if not category_product or not knowledge_context:
-        return False
-
-    category_product = set(category_product)
-    knowledge_lower = knowledge_context.lower()
-
-    # Simple heuristic detection
-    if "WEBSITE" in category_product and "seo" in knowledge_lower:
-        return True
-
-    if "SEO" in category_product and "website" in knowledge_lower:
-        return True
-
-    if "GOOGLE_ADS" in category_product and "seo" in knowledge_lower:
-        return True
-
-    return False
-
 # ===============================
 # ITERATIVE RAG RETRIEVAL ENGINE
 # ===============================
@@ -405,7 +388,7 @@ def iterative_node_search(
         user_category=None,
         prev_node_id=None,
         assistant_category=None,
-        custom_threshold=0.2
+        custom_threshold=0.45
     )
 
     if best:
@@ -435,7 +418,7 @@ def llm_validate_and_generate(
     if context_messages:
         context = "\n".join(
             f"{m['role']}: {m['content']}"
-            for m in context_messages[-9:]
+            for m in context_messages[-10:]
         )
 
     logger.debug("[LLM1] Preparing prompt for Claude")
@@ -444,112 +427,220 @@ def llm_validate_and_generate(
     logger.debug(f"[LLM1] context_length={len(context)}")
 
     prompt = f"""
-    Kamu adalah Admin Marketing WhatsApp representatif sebuah agency digital.
-    Jawab pertanyaan user dengan profesional, natural, jelas, dan tidak terdengar seperti bot.
+    You are a WhatsApp Marketing Admin representing a digital agency.
 
-    Gunakan gaya bahasa yang hangat, sopan, dan to the point.
-    Boleh menggunakan enter atau bullet agar pesan mudah dibaca dan tidak menumpuk dalam satu paragraf.
+    Your replies must sound natural, human, warm, and professional.
+    Do NOT sound like a bot, FAQ generator, or AI assistant.
 
-    =====================================================
-    IDENTITAS ADMIN
-    =====================================================
-
-    Jika klien MENANYAKAN nama kamu:
-    - Jika konteks berasal dari perusahaan EDA atau Asain → jawab nama: Aisyah
-    - Jika konteks berasal dari perusahaan EBYB → jawab nama: Alesha
-    - Jika asal perusahaan tidak diketahui → perkenalkan diri sebagai admin marketing tanpa menyebut nama
-
-    Jika tidak ditanya nama → jangan memperkenalkan diri.
-    Dilarang menyebut nama di luar aturan tersebut.
+    Always respond in the same language as the user.
+    If the user writes in Indonesian, respond in Indonesian.
+    If the user writes in English, respond in English.
 
     =====================================================
-    TUGAS UTAMA
+    CONTEXT PRIORITY (ABSOLUTE ORDER)
     =====================================================
 
-    1. Validasi dan olah KNOWLEDGE CONTEXT yang sudah dipilih sistem.
-    2. Gunakan SUMMARY CONTEXT sebagai riwayat percakapan.
-    3. Jawab fokus pada pertanyaan terakhir user.
-    4. Jangan overexplain.
-    5. Jangan terdengar seperti FAQ generator.
+    You must process information in this exact order:
 
-    Jika knowledge sebagian tidak relevan, ambil bagian yang relevan saja.
+    1) USER MESSAGE (highest authority)
+    2) SUMMARY CONTEXT (conversation continuity only)
+    3) KNOWLEDGE CONTEXT (lowest authority, must be validated)
 
-    Jika knowledge kosong atau tidak relevan:
-    - Boleh gunakan pengetahuan umum digital marketing.
-    - Dilarang mengarang informasi krusial perusahaan (nama paket, harga spesifik, promo, syarat khusus, kontak, alamat, rekening).
-
-    Jika user menanyakan info krusial yang tidak ada di knowledge, gunakan respon koordinasi tim seperti ini:
-    "Terima kasih atas pertanyaannya😊 Untuk memastikan informasi yang akurat, izin kami koordinasikan terlebih dahulu dengan tim terkait ya. Nanti akan segera kami informasikan kembali🙏"
+    USER MESSAGE always overrides everything.
+    KNOWLEDGE CONTEXT is NEVER allowed to override USER MESSAGE.
 
     =====================================================
-    GAYA JAWABAN
+    ADMIN IDENTITY RULE (STRICT)
     =====================================================
 
-    - Natural seperti admin manusia.
-    - Tidak kaku.
-    - Tidak terlalu formal.
-    - Tidak promosi agresif.
-    - Tidak menanyakan ulang hal/info yang sudah jelas disampaikan oleh user
-    - Maksimal 2 emoticon ringan.
-    - Tanda seru tidak boleh digunakan. Jika muncul, ubah menjadi titik.
-    - Jangan gunakan markdown seperti **bold**. Gunakan format WhatsApp jika perlu: *contoh*.
+    If the user ASKS your name:
+    - If company context is EDA or Asain → introduce yourself as Aisyah.
+    - If company context is EBYB → introduce yourself as Alesha.
+    - If company origin is unknown → introduce yourself only as admin marketing {"{{$company}}"} (no personal name).
+
+    If the user does NOT ask your name:
+    - Do NOT introduce yourself.
+    - Never mention any name outside these rules.
 
     =====================================================
-    DETEKSI CATEGORY PRODUCT (WAJIB)
+    USER MESSAGE PRIORITY OVERRIDE (CRITICAL)
     =====================================================
-    Tentukan produk yang dibahas berdasarkan prioritas berikut:
-    1. USER MESSAGE (eksplisit)
+
+    If the USER MESSAGE:
+    - Does NOT explicitly mention a product category,
+    - Does NOT mention a specific package,
+    - Is a greeting or general inquiry,
+
+    Then:
+
+    - category_product = null
+    - knowledge_relevant = false
+    - force_optional_llm = false
+    - IGNORE KNOWLEDGE CONTEXT completely.
+
+    In this case:
+    Respond naturally and ask clarification.
+    Never let KNOWLEDGE CONTEXT decide the product
+    if the USER MESSAGE does not explicitly mention one.
+
+    =====================================================
+    STRICT KNOWLEDGE VALIDATION (CRITICAL)
+    =====================================================
+
+    KNOWLEDGE CONTEXT is raw RAG output.
+    It may contain low-similarity, mixed-package, or partially related nodes.
+    Do NOT assume it is fully relevant.
+    If KNOWLEDGE CONTEXT is EMPTY → treat as NOT relevant.
+
+    For ANY service-related question (package, pricing, feature, process, timeline, domain, hosting, add-on, technical detail):
+
+    You may answer using KNOWLEDGE CONTEXT ONLY IF ALL conditions are met:
+
+    1. Exact product category matches.
+    2. Exact package name mentioned by user exists explicitly.
+    3. Exact requested detail exists explicitly.
+    4. No inference, comparison, estimation, or assumption is needed.
+    5. No different package name appears in the knowledge.
+
+    Same category ≠ relevant.
+    Different package ≠ relevant.
+
+    If ANY condition fails:
+        knowledge_relevant = false
+        force_optional_llm = true
+        Do NOT approximate.
+        Do NOT fill gaps.
+        Do NOT infer from other packages.
+
+    If there is ANY doubt → treat as mismatch.
+
+    -----------------------------------------------------
+
+    SUMMARY CONTEXT:
+    - Used only to understand conversation flow.
+    - Helps resolve references like “itu” or “yang tadi”.
+    - Cannot introduce new product assumptions.
+    - Cannot override USER MESSAGE.
+
+    =====================================================
+    RESPONSE STYLE RULES
+    =====================================================
+
+    - Natural WhatsApp tone.
+    - Not stiff.
+    - Not brochure-style.
+    - Not overly formal.
+    - Not aggressive selling.
+    - Do not re-ask clearly answered information.
+    - Maximum 2 light emojis.
+    - Avoid long bullet lists.
+    - Do NOT explain features one by one unless explicitly requested.
+
+    =====================================================
+    PRODUCT CATEGORY DETECTION (MANDATORY LOGIC)
+    =====================================================
+    Determine category_product using this priority:
+    1. USER MESSAGE
     2. USER INTENT
     3. SUMMARY CONTEXT
 
-    Kategori yang diperbolehkan:
-    1. WEBSITE  
+    Allowed categories:
+
+    1. WEBSITE
     (paket website, buat website, harga website, domain, hosting, fitur website, webmail/email bisnis, payment gateway, toko online, multibahasa, redesign website,
     only design, hapus copyright, beli putus, custom website)
 
-    2. SEO  
-    (optimasi website agar muncul di hasil pencarian Google, peningkatan ranking google, riset keyword, on-page SEO, technical SEO, optimasi konten,
-    laporan performa, biaya & paket SEO)
+    2. SEO
+    (optimasi website agar muncul di Google, ranking Google, riset keyword, on-page SEO, technical SEO, optimasi konten, laporan performa, biaya SEO)
 
-    3. GOOGLE_ADS  
-    (iklan Google, mengiklankan website di Google, pembuatan akun Google Ads, pemasangan tracking konversi Google Ads, penyetingan kampanye Google Ads)
+    3. GOOGLE_ADS
+    (iklan Google, akun Google Ads, tracking konversi, setting kampanye Google Ads)
 
-    4. SOSMED_ADS  
-    (Instagram Ads, Facebook Ads, TikTok Ads, YouTube Ads, optimasi iklan sosial media, meningkatkan penjualan/leads lewat iklan sosial media)
+    4. SOSMED_ADS
+    (Instagram Ads, Facebook Ads, TikTok Ads, YouTube Ads, optimasi iklan sosial media)
 
-    5. COMPANY_PROFILE_PDF  
+    5. COMPANY_PROFILE_PDF
     (pembuatan company profile dalam bentuk dokumen/PDF, bukan website)
 
-    6. SOSIAL_MEDIA_NON_ADS  
-    (pembuatan akun IG/FB/YouTube, jasa kelola IG/FB/TikTok/YouTube, tambah followers IG, tambah viewers IG, tambah likes TikTok)
+    6. SOSIAL_MEDIA_NON_ADS
+    (pembuatan akun IG/FB/YouTube, kelola sosmed, tambah followers, viewers, likes)
 
-    7. LAYANAN_DIGITAL_LAINNYA  
-    (artikel ID/EN, video promosi, desain banner, kartu nama, desain logo, LinkTree, proposal bisnis, promosi status WA, pembuatan Google Bisnis/Google Maps)
-    
-    Aturan:
-    - Jika eksplisit menyebut produk → wajib array sesuai produk, contoh ["WEBSITE"]
-    - Jika lebih dari satu → contoh ["WEBSITE", "SEO"]
-    - Jika hanya greeting tanpa konteks → null
-    - Dilarang membuat kategori baru
-    - Dilarang mengembalikan array kosong []
+    7. LAYANAN_DIGITAL_LAINNYA
+    (artikel, video promosi, desain banner, kartu nama, logo, LinkTree, proposal bisnis, promosi WA, Google Bisnis/Maps)
+
+    Rules:
+    - If explicitly mentioned → must return array like ["WEBSITE"]
+    - If multiple → ["WEBSITE", "SEO"]
+    - If greeting only → null
+    - Forbidden to create new categories
+    - Forbidden to return empty array []
 
     =====================================================
-    SELF-EVALUATION (WAJIB)
+    SELF-EVALUATION (STRICT ANTI-HALLUCINATION LOGIC)
     =====================================================
-    Tentukan:
-    - "knowledge_relevant": true jika KNOWLEDGE CONTEXT benar-benar relevan dengan pertanyaan terakhir.
-    - false jika kosong / mismatch / beda produk.
-    - "confidence_score": angka 0.0–1.0 menunjukkan tingkat keyakinan terhadap jawaban final.
-    - "force_optional_llm": true jika:
-        • Jawaban membutuhkan informasi spesifik yang tidak tertulis jelas di KNOWLEDGE CONTEXT.
-        • Pertanyaan menyangkut biaya tambahan, selisih harga, pengecualian paket, domain khusus (.co.id, dll), add-on, atau kondisi khusus.
-        • KNOWLEDGE CONTEXT terlalu umum untuk memastikan jawaban 100% akurat.
-    - false jika KNOWLEDGE CONTEXT sudah eksplisit dan pasti.
+    You must evaluate logically, not optimistically.
+
+    -----------------------------
+    1) knowledge_relevant
+    -----------------------------
+
+    Set to TRUE ONLY IF ALL conditions below are met:
+    - KNOWLEDGE CONTEXT matches the active product category.
+    - The exact package or item asked by the user exists explicitly in KNOWLEDGE CONTEXT.
+    - The specific detail requested by the user is explicitly written in KNOWLEDGE CONTEXT.
+    - No assumption is required.
+
+    Set to FALSE if ANY of the following occur:
+    - KNOWLEDGE CONTEXT is EMPTY.
+    - The package name is mentioned but its detailed features are NOT explicitly written.
+    - The user asks about specific features but knowledge only contains other packages.
+    - Knowledge is generic while the question is specific.
+    - You would need to assume, estimate, or guess.
+    - There is any product-category inconsistency.
+    - You feel even slightly unsure.
+
+    If there is doubt → set FALSE.
+
+    -----------------------------
+    2) force_optional_llm
+    -----------------------------
+
+    Set to TRUE if ANY of the following occur:
+    - knowledge_relevant is FALSE.
+    - The user asks about detailed package features but the exact feature list is not explicitly available.
+    - The user asks about pricing adjustments, negotiation, or custom DP.
+    - The user asks about domain extensions or add-ons not clearly written.
+    - There is ambiguity between multiple packages.
+    - The knowledge is partial, incomplete, or mixed between packages.
+    - confidence_score would reasonably be below 0.80.
+
+    When unsure → set TRUE.
+
+    Set to FALSE ONLY if:
+    - The package and its details are explicitly written.
+    - No assumption is required.
+    - Product context is fully consistent.
+    - You are highly certain.
+
+    -----------------------------
+    3) confidence_score
+    -----------------------------
+
+    Provide a float between 0.0 and 1.0.
+
+    0.90–0.99 → Exact package + exact detail clearly written.
+    0.75–0.89 → Mostly clear, very minor uncertainty.
+    0.50–0.74 → Partial detail available.
+    Below 0.50 → Mismatch or assumption needed.
+
+    If you had to assume any missing detail → score must be below 0.80.
+
+    Never output 1.0.
+    Never inflate confidence.
 
     =====================================================
     INPUT
     =====================================================
-
     SUMMARY CONTEXT:
     {context}
 
@@ -560,20 +651,19 @@ def llm_validate_and_generate(
     {user_intent}
 
     KNOWLEDGE CONTEXT:
-    {knowledge_context if knowledge_context else "(KOSONG)"}
+    {knowledge_context if knowledge_context else "(EMPTY)"}
 
     =====================================================
-    OUTPUT (WAJIB JSON ONLY)
+    OUTPUT (JSON ONLY)
     =====================================================
     {{
-    "response": "jawaban final yang ringkas dan natural",
+    "response": "final short and natural WhatsApp reply",
     "category_product": null,
     "knowledge_relevant": true,
     "force_optional_llm": false,
     "confidence_score": 0.0
     }}
     """
-
     try:
         logger.debug("[LLM1] Calling Claude validate+generate")
 
@@ -627,36 +717,65 @@ def llm_optional_product_regenerate(
     if context_messages:
         context = "\n".join(
             f"{m['role']}: {m['content']}"
-            for m in context_messages[-9:]
+            for m in context_messages[-10:]
         )
 
     product_knowledge = get_product_knowledge(category_product)
 
     prompt = f"""
-    Kamu adalah Admin Marketing WhatsApp representatif sebuah agency digital.
+    You are a WhatsApp Marketing Admin representing {"{{$company}}"}.  
 
-    Previous response TIDAK sesuai dengan knowledge produk resmi.
-    Tugas kamu adalah memperbaiki jawaban tersebut agar sepenuhnya akurat dan tetap terdengar natural seperti admin manusia.
+    The previous response was NOT aligned with official product knowledge.  
+    Your task is to correct and rewrite it so it becomes:
+
+    - Fully accurate based ONLY on official knowledge.
+    - Natural and human-like.
+    - Short, clear, and persuasive.
+    - Focused only on the active product.
+
+    Always respond in the same language as the user.
+    If the user writes in Indonesian, respond in Indonesian.
+    If the user writes in English, respond in English.
 
     =====================================================
-    PRODUK YANG WAJIB DIFOKUSKAN
+    INFORMATION PRIORITY (STRICT ORDER)
     =====================================================
+    1. USER MESSAGE (highest authority)
+    2. OFFICIAL PRODUCT KNOWLEDGE
+    3. PREVIOUS RESPONSE (reference only for correction)
+
+    If PREVIOUS RESPONSE contains any information
+    that is NOT explicitly written in OFFICIAL PRODUCT KNOWLEDGE,
+    you MUST remove it completely.
+
+    =====================================================
+    ACTIVE PRODUCT (STRICT FOCUS)
+    =====================================================
+    You MUST focus ONLY on:
     {category_product}
 
+    Switching product or mentioning other services is strictly forbidden.
+
+    If category_product contains multiple items,
+    use knowledge strictly within each category.
+    Do NOT mix details between categories.
+
     =====================================================
-    KNOWLEDGE RESMI PRODUK
+    OFFICIAL PRODUCT KNOWLEDGE
     =====================================================
     {product_knowledge}
 
+    If OFFICIAL PRODUCT KNOWLEDGE is empty,
+    you MUST use the coordination response.
+
     =====================================================
-    PREVIOUS RESPONSE DARI LLM1 (SALAH / TIDAK SESUAI)
+    PREVIOUS RESPONSE (INCORRECT / NEEDS FIX)
     =====================================================
     {previous_response}
 
     =====================================================
-    INPUT TAMBAHAN
+    ADDITIONAL CONTEXT
     =====================================================
-
     SUMMARY CONTEXT:
     {context}
 
@@ -667,26 +786,31 @@ def llm_optional_product_regenerate(
     {user_intent}
 
     =====================================================
-    ATURAN WAJIB
+    MANDATORY RULES
     =====================================================
+    1. Use ONLY information available in OFFICIAL PRODUCT KNOWLEDGE.
+    2. Ignore any details not explicitly written in the knowledge.
+    3. Do NOT invent pricing, promotions, technical details, add-ons, or policies.
+    4. Answer ONLY the user's latest question.
+    5. Maximum 3–6 WhatsApp lines (including line breaks).
+    6. If the response feels long, rewrite it shorter.
+    7. Do NOT overexplain.
+    8. Do NOT list features one by one unless explicitly requested.
+    9. Be slightly persuasive, not purely informational.
+    10. Guide softly to next step when appropriate.
+    11. Maximum 2 light emojis.
+    12. Do NOT sound like a brochure or catalog.
+    13. Do NOT repeat information already clear in context.
 
-    1. Gunakan hanya informasi yang ada dalam knowledge resmi.
-    2. Abaikan informasi yang tidak ada dalam knowledge.
-    3. Jangan menambah asumsi, harga, promo, atau detail teknis di luar knowledge.
-    4. Fokus hanya pada produk yang ditentukan.
-    5. Jangan membahas produk lain.
-    6. Jawaban harus natural, profesional, dan tidak terdengar seperti bot.
-    7. Tidak boleh menggunakan tanda seru. Jika muncul, ubah menjadi titik.
-    8. Maksimal 2 emoticon ringan.
-    9. Boleh menggunakan enter atau bullet agar pesan mudah dibaca.
+    If official knowledge is insufficient to answer with certainty,
+    use this coordination response naturally:
 
-    Jika knowledge tidak cukup untuk menjawab secara pasti, gunakan respon koordinasi tim secara natural.
+    "Terima kasih atas pertanyaannya😊 Untuk memastikan informasi yang akurat, izin kami koordinasikan terlebih dahulu dengan tim terkait ya. Nanti akan segera kami informasikan kembali🙏"
 
     =====================================================
     OUTPUT
     =====================================================
-
-    Berikan jawaban final dalam bentuk teks saja.
+    Return the final corrected WhatsApp reply as plain text only.
     """
 
     logger.debug(f"[OPTIONAL LLM] prompt_length={len(prompt)}")
@@ -733,54 +857,52 @@ def sanitize_llm_response(
     logger.debug(f"[LLM2] price_context_length={len(price_context)}")
 
     prompt = f"""
-    Kamu adalah AI VALIDATOR & SANITIZER profesional.
-    Posisi kamu adalah FINAL GATE sebelum jawaban dikirim ke user.
+    You are a professional AI VALIDATOR & SANITIZER.
+    You are the FINAL GATE before the response is sent to the user.
 
-    TUGAS UTAMA:
-    1) Validasi dan koreksi harga produk jika tidak sesuai dengan daftar harga resmi.
-    2) Sanitasi data sensitif yang mungkin masih muncul pada response dari PREVIOUS LAYER.
+    MAIN TASK:
+    1) Validate and correct product pricing if it does not match the official price list.
+    2) Sanitize sensitive data that may still appear in the response from the PREVIOUS LAYER.
 
-    KAMU TIDAK BOLEH:
-    Membuat jawaban baru/Menambah kalimat baru/Mengubah struktur kalimat/Mengubah gaya bahasa/Melakukan parafrase.
+    YOU ARE NOT ALLOWED TO:
+    Create a new response / Add new sentences / Change sentence structure / Change writing style / Paraphrase.
 
-    KAMU HANYA BOLEH:
-    - Mengganti angka harga yang salah.
-    - Mengganti data sensitif dengan placeholder yang sesuai.
-
-    ================================================
-    ATURAN VALIDASI HARGA PRODUK
-    ================================================
-
-    - CATEGORY_PRODUCT menunjukkan produk yang sedang dibahas.
-    - PRICE_CONTEXT adalah daftar harga resmi produk tersebut.
-    - Gunakan PRICE_CONTEXT sebagai satu-satunya referensi harga yang benar.
-    - Analisis teks pada FINAL RESPONSE (PREVIOUS LAYER).
-
-    Jika FINAL RESPONSE menyebut angka harga:
-    → Pastikan angka tersebut SAMA dengan harga resmi di PRICE_CONTEXT.
-    → Jika berbeda, GANTI hanya angka harga yang salah.
-    → Jangan mengubah kalimat lain.
-
-    Jika harga sudah benar:
-    → Jangan diubah.
-
-    Jika tidak ada harga disebut:
-    → Jangan menambahkan harga.
-
-    Jika CATEGORY_PRODUCT null atau kosong:
-    → Jangan lakukan validasi harga sama sekali.
+    YOU ARE ONLY ALLOWED TO:
+    - Replace incorrect price numbers.
+    - Replace sensitive data with the appropriate placeholder.
 
     ================================================
-    ATURAN SANITASI DATA SENSITIF
+    PRODUCT PRICE VALIDATION RULES
     ================================================
+    - CATEGORY_PRODUCT indicates the product being discussed.
+    - PRICE_CONTEXT is the official price list of that product.
+    - Use PRICE_CONTEXT as the only valid pricing reference.
+    - Analyze the text inside FINAL RESPONSE (PREVIOUS LAYER).
 
-    Penggantian hanya dilakukan jika teks SECARA EKSPLISIT menyebut data internal berikut.
-    Jangan mengganti berdasarkan asumsi.
-    Jangan mengganti kata umum.
+    If FINAL RESPONSE contains a price number:
+    → Ensure the number EXACTLY matches the official price in PRICE_CONTEXT.
+    → If different, REPLACE only the incorrect price number.
+    → Do not modify any other part of the sentence.
 
-    1. Nama perusahaan internal
+    If the price is already correct:
+    → Do not change anything.
 
-    HANYA jika teks secara eksplisit dan persis menyebut salah satu nama berikut:
+    If no price is mentioned:
+    → Do not add any price.
+
+    If CATEGORY_PRODUCT is null or empty:
+    → Do not perform any price validation.
+
+    ================================================
+    SENSITIVE DATA SANITIZATION RULES
+    ================================================
+    Replacement is only allowed if the text EXPLICITLY mentions the following internal data.
+    Do not replace based on assumptions.
+    Do not replace general words.
+
+    1. Internal company name
+
+    ONLY if the text explicitly and exactly mentions one of the following:
     - Asain
     - EDA
     - EbyB
@@ -788,43 +910,43 @@ def sanitize_llm_response(
     - PT. Eksa Digital Agency
     - PT. EBYB Global Marketplace
 
-    Maka WAJIB diganti menjadi:
+    Then it MUST be replaced with:
     {"{{$company}}"}
 
-    Jika hanya menyebut kata umum seperti:
+    If the text only contains general words such as:
     - perusahaan
     - company
     - bisnis
     - usaha
     - perusahaan kakak
-    MAKA JANGAN DIGANTI.
+    DO NOT replace them.
 
     -----------------------------------------------------------------------------
 
-    2. Alamat perusahaan internal
+    2. Internal company address
 
-    HANYA jika menyebut alamat resmi perusahaan internal (Asain, EDA, atau EbyB).
+    ONLY if it mentions the official address of internal companies (Asain, EDA, or EbyB).
 
-    Bukan alamat milik klien.
-    Bukan alamat umum.
-    Bukan contoh alamat.
+    Not user address.
+    Not general address.
+    Not example address.
 
-    Jika menyebut alamat internal secara spesifik,
-    WAJIB diganti menjadi:
+    If it explicitly mentions internal company address,
+    it MUST be replaced with:
     {"{{$address}}"}
 
-    ------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------
 
-    3. Nomor rekening pembayaran internal
+    3. Internal payment bank account number
 
-    HANYA jika menyebut nomor rekening milik perusahaan internal (Asain, EDA, atau EbyB).
+    ONLY if it explicitly mentions internal company bank account numbers (Asain, EDA, or EbyB).
 
-    Bukan rekening klien.
-    Bukan contoh rekening.
-    Bukan sekadar menyebut nama bank.
+    Not user bank account.
+    Not example account.
+    Not merely bank name mention.
 
-    Jika menyebut nomor rekening internal secara spesifik,
-    WAJIB diganti menjadi:
+    If it explicitly mentions internal bank account number,
+    it MUST be replaced with:
     {"{{$rekening_pembayaran}}"}
 
     ================================================
@@ -836,7 +958,7 @@ def sanitize_llm_response(
     USER INTENT:
     {user_intent}
 
-    KONTEKS:
+    CONTEXT:
     {context}
 
     FINAL RESPONSE (PREVIOUS LAYER):
@@ -852,11 +974,12 @@ def sanitize_llm_response(
     OUTPUT (JSON ONLY)
     ================================================
     {{
-    "response": "response hanya data sensitif yang diganti",
+    "response": "response with only sensitive data replaced if any",
     "sensitive_found": true/false,
     "price_corrected": true/false
     }}
     """
+
     logger.debug(f"[LLM2] prompt_length={len(prompt)}")
     logger.debug(f"[LLM2] raw_response_length={len(raw_response) if raw_response else 0}")
 
@@ -1250,10 +1373,16 @@ def generate_assistant_response(
         knowledge_context = knowledge_data.get("knowledge_context", "")
         assistant_node_id = knowledge_data.get("assistant_node_id")
 
-    else:
-        detected_intent = user_intent
-        knowledge_context = ""
-        assistant_node_id = None
+        knowledge_context = trim_text_by_char(knowledge_context, 15000)
+
+        best_similarity = metadata.get("best_sim", 0)
+
+        if best_similarity < 0.5:
+            logger.debug(
+                f"[RAG CONFIDENCE GATE] similarity={round(best_similarity,3)} < 0.5 → knowledge ignored"
+            )
+            knowledge_context = ""
+            assistant_node_id = None
 
     # =========================================================
     # CALL LLM1
@@ -1277,6 +1406,13 @@ def generate_assistant_response(
     # =========================================================
     # PRODUCT MEMORY LOGIC
     # =========================================================
+
+    # Pastikan session_category_product selalu list
+    if not isinstance(session_category_product, list):
+        session_category_product = (
+            [session_category_product] if session_category_product else []
+        )
+
     if detected_category_product == "__PARSING_ERROR__":
         # Parsing gagal → pakai memory lama
         final_category_product = session_category_product
@@ -1286,10 +1422,18 @@ def generate_assistant_response(
         final_category_product = session_category_product
 
     elif isinstance(detected_category_product, list):
-        final_category_product = detected_category_product
+
+        # Merge tanpa duplikasi
+        merged = session_category_product.copy()
+
+        for cat in detected_category_product:
+            if cat not in merged:
+                merged.append(cat)
+
+        final_category_product = merged
 
     else:
-        # unexpected format → fallback aman
+        # Unexpected format → fallback aman
         final_category_product = session_category_product
 
     # =========================================================
@@ -1302,10 +1446,19 @@ def generate_assistant_response(
     confidence_score = float(llm_result.get("confidence_score", 0.0))
     force_optional_llm = llm_result.get("force_optional_llm", False)
 
-    if final_category_product and (
-        force_optional_llm
-        or knowledge_relevant is False
-        or confidence_score < 0.5
+    has_active_product_signal = (
+        detected_category_product
+        and detected_category_product != "__PARSING_ERROR__"
+    )
+
+    if (
+        has_active_product_signal
+        and final_category_product
+        and (
+            force_optional_llm
+            or knowledge_relevant is False
+            or confidence_score < 0.80
+        )
     ):
 
         optional_response = llm_optional_product_regenerate(
@@ -1342,9 +1495,11 @@ def generate_assistant_response(
 
     final_response = sanitized.get("response", raw_response)
     final_response = final_response.replace("!", ".")
+    final_response = re.sub(r"\*{2,}(.*?)\*{2,}", r"*\1*", final_response)
+    final_response = re.sub(r'\n+', '\n', final_response)
+    final_response = re.sub(r'\.\s+([\U0001F300-\U0001FAFF])', r'\1', final_response)
     llm2_prompt = sanitized.get("prompt")
     llm2_output = sanitized.get("raw_output")
-    
 
     logger.debug(f"[LLM2 RESULT] response_preview={str(final_response)[:100]}")
     logger.debug(f"[FINAL CATEGORY PRODUCT] {final_category_product}")
@@ -1390,7 +1545,7 @@ def chat_with_session(user_message, session_id, reset=False):
         # BUILD CONTEXT
         context_messages = build_conversation_context(
             session_data,
-            max_messages=9
+            max_messages=10
         )
 
         # INTENT & FLOW CATEGORY (ONCE)
@@ -1459,7 +1614,6 @@ def chat_with_session(user_message, session_id, reset=False):
     sensitive_found = result.get("sensitive_found")
     price_corrected = result.get("price_corrected")
     
-
     assistant_node = NODES.get(assistant_node_id, {}) if assistant_node_id else {}
 
     # =================
@@ -1475,26 +1629,19 @@ def chat_with_session(user_message, session_id, reset=False):
         session_data["prev_node_id"] = assistant_node_id
         session_data["assistant_category"] = assistant_node.get("category") or user_category
 
-        # =====================================
-        # STATE MEMORY CATEGORY PRODUCT
-        # =====================================
-        last_category_product = session_data.get("category_product", [])
+    # =====================================
+    # STATE MEMORY CATEGORY PRODUCT
+    # =====================================
 
-        if detected_category_product == "__PARSING_ERROR__":
-            session_data["category_product"] = last_category_product
-        elif detected_category_product:
-            # Ada produk baru terdeteksi
-            session_data["category_product"] = detected_category_product
-        else:
-            # Tidak ada produk baru → pertahankan memory lama
-            session_data["category_product"] = last_category_product
+    # Gunakan hasil final dari generate_assistant_response
+    session_data["category_product"] = result.get("category_product", [])
 
-        logger.debug(
-            f"[PRODUCT MEMORY] detected={detected_category_product} | "
-            f"previous={last_category_product} | "
-            f"final={session_data.get('category_product')}"
-        )
-        SESSION_STORE[session_id] = session_data
+    logger.debug(
+        f"[PRODUCT MEMORY FINALIZED] "
+        f"stored={session_data.get('category_product')}"
+    )
+
+    SESSION_STORE[session_id] = session_data
 
     # ======================
     # DEBUG INFO
@@ -1525,7 +1672,7 @@ def chat_with_session(user_message, session_id, reset=False):
         # CONTEXT SNAPSHOT
         "context_summary": " | ".join(
             f"{m['role']}: {m['content']}"
-            for m in context_messages[-9:]
+            for m in context_messages[-10:]
         ) if context_messages else None,
         "knowledge_context": knowledge_context,
 

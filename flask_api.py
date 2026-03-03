@@ -268,7 +268,7 @@ def run_pipeline():
 # ==========================================================================================================
 # ==========================================================================================================
 
-from response_claude import NODE_EMB, NODES, chat_with_session, load_flow_and_embeddings
+from response_claude import chat_with_session, load_flow_and_embeddings
 load_flow_and_embeddings() 
 
 # ==========================

@@ -46,12 +46,14 @@ def label_and_build_global_flow_parallel(
     temperature=0.1,
     save_path="output/global_flow.db",
     embedding_save_path="output/embeddings.db",
+    intent_embedding_save_path="output/intent_embeddings.db",
     max_nodes=None,
     include_roles=("user", "assistant"),
     verbose=True,
     load_existing=True,
     existing_flow_path="output/global_flow.db",
     existing_embedding_path="output/embeddings.db",
+    existing_intent_embedding_path="output/intent_embeddings.db",
     save_only_new_nodes=False,
     max_workers=8
 ):
@@ -173,6 +175,27 @@ def label_and_build_global_flow_parallel(
 
     embedding_cache = {}
     node_embedding_cache = {}
+    intent_embedding_cache = {}
+
+    # ===========================
+    # LOAD INTENT EMBEDDINGS
+    # ===========================
+    if os.path.exists(intent_embedding_save_path):
+        try:
+            conn = sqlite3.connect(intent_embedding_save_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT node_id, intent, embedding FROM intent_embeddings")
+            rows = cursor.fetchall()
+            conn.close()
+
+            for node_id, intent, emb_str in rows:
+                intent_embedding_cache[node_id] = json.loads(emb_str)
+
+            if verbose:
+                print(f"Loaded {len(intent_embedding_cache)} intent embeddings.")
+
+        except Exception as e:
+            print("Gagal load intent embeddings:", e)
 
     # ====================
     # LOAD EXISTING NODES
@@ -392,6 +415,41 @@ def label_and_build_global_flow_parallel(
             node_embedding_cache[node_id] = avg
             return avg
         return []
+
+    # ===========================
+    # SAVE INTENT EMBEDDINGS
+    # ===========================
+    def save_intent_embeddings():
+        try:
+            os.makedirs(os.path.dirname(intent_embedding_save_path), exist_ok=True)
+            conn = sqlite3.connect(intent_embedding_save_path)
+            cursor = conn.cursor()
+
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS intent_embeddings (
+                node_id TEXT PRIMARY KEY,
+                intent TEXT,
+                embedding TEXT
+            )
+            """)
+
+            for node_id, node in FLOW["nodes"].items():
+                intent = node["intent"]
+
+                if node_id not in intent_embedding_cache:
+                    continue
+
+                cursor.execute(
+                    "INSERT OR REPLACE INTO intent_embeddings (node_id, intent, embedding) VALUES (?, ?, ?)",
+                    (node_id, intent, json.dumps(intent_embedding_cache[node_id]))
+                )
+
+            conn.commit()
+            conn.close()
+            print(f"[autosave] Intent embeddings disimpan → {intent_embedding_save_path}")
+
+        except Exception as e:
+            print("Gagal menyimpan intent embeddings:", e)
 
     # ==================================================
     # FALLBACK: ISI ANSWER KOSONG DENGAN SIMILARITY
@@ -792,6 +850,33 @@ def label_and_build_global_flow_parallel(
 
     fill_empty_answers_with_similarity(FLOW)
 
+    # ===================================
+    # BUILD INTENT EMBEDDINGS (FINAL)
+    # ===================================
+    intents_to_embed = []
+    node_ids_to_embed = []
+
+    for node_id, node in FLOW["nodes"].items():
+
+        if node_id in intent_embedding_cache:
+            continue
+
+        intent_text = node.get("intent")
+        if not intent_text:
+            continue
+
+        intents_to_embed.append(intent_text)
+        node_ids_to_embed.append(node_id)
+
+    if intents_to_embed:
+        emb_resp = client.embeddings.create(
+            model="text-embedding-3-large",
+            input=intents_to_embed
+        )
+
+        for node_id, emb_data in zip(node_ids_to_embed, emb_resp.data):
+            intent_embedding_cache[node_id] = emb_data.embedding
+
     # ==============
     # SET START NODE
     # ==============
@@ -803,6 +888,7 @@ def label_and_build_global_flow_parallel(
 
     save_flow()
     save_embeddings()
+    save_intent_embeddings()
 
     new_nodes_only = {
         nid: node for nid, node in FLOW["nodes"].items()

@@ -34,7 +34,7 @@ logger = logging.getLogger("CHATBOT_ENGINE")
 # CONFIG
 # ======================
 FLOW_PATH = "output/global_flow.db"
-NODE_EMB_PATH = "output/embeddings.db"
+INTENT_EMB_PATH = "output/intent_embeddings.db"
 EMBEDDING_CACHE = OrderedDict() 
 EMBEDDING_CACHE_MAX_SIZE = 1000
 SESSION_STORE_MAX_SIZE = 500
@@ -52,6 +52,9 @@ claude_client = anthropic.Anthropic(
 )
 SESSION_STORE = {}
 SESSION_LOCK = threading.Lock()
+MESSAGE_BUFFER = {}
+BUFFER_LOCK = threading.Lock()
+DEBOUNCE_SECONDS = 1
 
 # ======================
 # LOAD DATA
@@ -59,11 +62,11 @@ SESSION_LOCK = threading.Lock()
 FLOW = None
 EMB = None
 NODES = None
-NODE_EMB = None
 LOADED = False
+NODE_INTENT_EMB = None
 
 def load_flow_and_embeddings():
-    global NODES, NODE_EMB, LOADED
+    global NODES, NODE_INTENT_EMB, LOADED
 
     if LOADED:
         return
@@ -71,8 +74,8 @@ def load_flow_and_embeddings():
     if not os.path.exists(FLOW_PATH):
         raise FileNotFoundError("global_flow.db belum ada. Jalankan pipeline dulu.")
 
-    if not os.path.exists(NODE_EMB_PATH):
-        raise FileNotFoundError("embeddings.db belum ada.")
+    if not os.path.exists(INTENT_EMB_PATH):
+        raise FileNotFoundError("intent_embeddings.db belum ada.")
 
     # ======================
     # LOAD FLOW FROM SQLITE
@@ -123,26 +126,25 @@ def load_flow_and_embeddings():
     db.close()
 
     # ===========================
-    # LOAD EMBEDDINGS FROM SQLITE
+    # LOAD INTENT EMBEDDINGS
     # ===========================
-    emb_db = get_db(NODE_EMB_PATH)
-    emb_cur = emb_db.cursor()
+    intent_db = get_db(INTENT_EMB_PATH)
+    intent_cur = intent_db.cursor()
 
-    emb_cur.execute("""
-        SELECT text, embedding
-        FROM embeddings
+    intent_cur.execute("""
+        SELECT node_id, embedding
+        FROM intent_embeddings
     """)
 
-    NODE_EMB = {}
-    for text, emb_str in emb_cur.fetchall():
+    NODE_INTENT_EMB = {}
+
+    for node_id, emb_str in intent_cur.fetchall():
         try:
-            if not text:
-                continue
-            NODE_EMB[text] = ast.literal_eval(emb_str)
+            NODE_INTENT_EMB[node_id] = ast.literal_eval(emb_str)
         except Exception:
             continue
 
-    emb_db.close()
+    intent_db.close()
 
 # ======================
 # UTILS
@@ -164,15 +166,6 @@ def cosine_similarity(vecA, vecB):
     if magA == 0 or magB == 0:
         return 0.0
     return dot / (magA * magB)
-
-def dynamic_threshold(text):
-    length = len(text.split())
-    if length <= 3:
-        return 0.4  
-    elif length <= 6:
-        return 0.5 
-    else:
-        return 0.6
 
 def safe_parse_json(text):
     try:
@@ -231,12 +224,6 @@ def embed_text(text: str, max_retries: int = 3):
 
     logger.critical("[EMBED FAILED] All retries exhausted")
     raise RuntimeError("Embedding generation failed") from last_exception
-
-def build_conversation_context(session_data, max_messages=10):
-    history = session_data.get("history", [])
-    if not history:
-        return []
-    return history[-max_messages:]
 
 def get_top_priority_candidates(candidates, top_k=5):
     if not candidates:
@@ -334,7 +321,7 @@ def iterative_node_search(
     assistant_category,
     max_attempts=5
 ):
-    threshold = dynamic_threshold(user_message)
+    threshold = 0.45
 
     logger.debug("========== ITERATIVE RAG START ==========")
     logger.debug(f"[ITERATIVE] user_message='{user_message}'")
@@ -1169,7 +1156,7 @@ def find_best_user_node(
     logger.debug("[ROUTING] Start find_best_user_node")
 
     candidates, flow_candidates, global_candidates = [], [], []
-    threshold = custom_threshold if custom_threshold is not None else dynamic_threshold(user_message)
+    threshold = custom_threshold if custom_threshold is not None else 0.45
     user_norm = normalize_text(user_message)
 
     logger.debug(f"[ROUTING] threshold={threshold}")
@@ -1191,13 +1178,12 @@ def find_best_user_node(
                 if cid in NODES and NODES[cid]["role"] == "user":
                     best_sim = 0.0
 
-                    for t in NODES[cid].get("texts", []):
-                        emb = NODE_EMB.get(t["chat"])
-                        if not emb:
-                            continue
+                    emb = NODE_INTENT_EMB.get(cid)
+                    if not emb:
+                        continue
 
-                        sim = cosine_similarity(user_vec, emb)
-                        best_sim = max(best_sim, sim)
+                    sim = cosine_similarity(user_vec, emb)
+                    best_sim = sim
 
                     if best_sim > 0:
                         flow_candidates.append((cid, best_sim))
@@ -1223,13 +1209,12 @@ def find_best_user_node(
 
             best_sim = 0.0
 
-            for t in node.get("texts", []):
-                emb = NODE_EMB.get(t["chat"])
-                if not emb:
-                    continue
+            emb = NODE_INTENT_EMB.get(nid)
+            if not emb:
+                continue
 
-                sim = cosine_similarity(user_vec, emb)
-                best_sim = max(best_sim, sim)
+            sim = cosine_similarity(user_vec, emb)
+            best_sim = sim
 
             if best_sim > 0:
                 global_candidates.append((nid, best_sim))
@@ -1349,15 +1334,18 @@ def generate_assistant_response(
     context_messages=None,
     session_category_product=None  
 ):
-    user_vec = embed_text(user_message)
+    intent_vec = embed_text(user_intent)
     best_user_node, metadata = iterative_node_search(
-        user_vec,
+        intent_vec,
         user_message,
         user_category,       
         prev_node_id,
         assistant_category 
     )
 
+    detected_intent = user_intent
+    knowledge_context = ""
+    assistant_node_id = None
     # =========================================================
     # DETERMINE KNOWLEDGE CONTEXT
     # =========================================================
@@ -1532,6 +1520,98 @@ def generate_assistant_response(
     }
 
 # ======================
+# SAVE MESSAGE TO DB
+# ======================
+def save_message(session_id, role, content):
+    conn = get_db("output/analysis.db")
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO session_history (session_id, role, chat)
+        VALUES (?, ?, ?)
+    """, (session_id, role, content))
+
+    conn.commit()
+    conn.close()
+
+def load_recent_messages(session_id, limit=10):
+    conn = get_db("output/analysis.db")
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT role, chat
+        FROM session_history
+        WHERE session_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+    """, (session_id, limit))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    rows.reverse()
+
+    return [
+        {"role": r[0], "content": r[1]}
+        for r in rows
+    ]
+
+def process_buffered_messages(session_id):
+    with BUFFER_LOCK:
+        data = MESSAGE_BUFFER.get(session_id)
+
+        if not data:
+            return None
+
+        messages = data.get("buffer", [])
+        MESSAGE_BUFFER.pop(session_id, None)
+
+    if not messages:
+        return None
+
+    combined_message = "\n".join(messages)
+
+    if not combined_message.strip():
+        return None
+
+    logger.debug(f"[DEBOUNCE PROCESS] session={session_id}")
+    logger.debug(f"[DEBOUNCE COMBINED MESSAGE]\n{combined_message}")
+
+    return chat_with_session(combined_message, session_id)
+
+def handle_incoming_message(user_message, session_id):
+
+    with BUFFER_LOCK:
+
+        if session_id not in MESSAGE_BUFFER:
+            MESSAGE_BUFFER[session_id] = {
+                "buffer": [],
+                "timer": None
+            }
+
+        # Tambah pesan ke buffer
+        MESSAGE_BUFFER[session_id]["buffer"].append(user_message)
+
+        # Cancel timer lama kalau ada
+        old_timer = MESSAGE_BUFFER[session_id]["timer"]
+        if old_timer:
+            old_timer.cancel()
+
+        # Set timer baru
+        timer = threading.Timer(
+            DEBOUNCE_SECONDS,
+            process_buffered_messages,
+            args=[session_id]
+        )
+
+        MESSAGE_BUFFER[session_id]["timer"] = timer
+        timer.start()
+
+    return {
+        "status": "waiting_for_more_messages"
+    }
+
+# ======================
 # MAIN ENTRY
 # ======================
 def chat_with_session(user_message, session_id, reset=False):
@@ -1539,14 +1619,13 @@ def chat_with_session(user_message, session_id, reset=False):
     logger.debug(f"[SESSION START] session_id={session_id}")
     logger.debug(f"[USER MESSAGE] {user_message}")
 
+    save_message(session_id, "user", user_message)
+
     with SESSION_LOCK:
-        session_data = SESSION_STORE.get(session_id, {})
+        session_data = dict(SESSION_STORE.get(session_id, {}))
 
         # BUILD CONTEXT
-        context_messages = build_conversation_context(
-            session_data,
-            max_messages=10
-        )
+        context_messages = load_recent_messages(session_id, limit=10)
 
         # INTENT & FLOW CATEGORY (ONCE)
         user_intent, user_category = call_intent_and_category(
@@ -1562,7 +1641,6 @@ def chat_with_session(user_message, session_id, reset=False):
             prev_node_id = None
             assistant_category = user_category
             session_data = {
-                "history": [],
                 "category_product": []
             }
             SESSION_STORE[session_id] = session_data
@@ -1620,12 +1698,6 @@ def chat_with_session(user_message, session_id, reset=False):
     # UPDATE SESSION 
     # =================
     with SESSION_LOCK:
-
-        history = session_data.get("history", [])
-        history.append({"role": "user", "content": user_message})
-        history.append({"role": "assistant", "content": final_response})
-
-        session_data["history"] = history[-9:]
         session_data["prev_node_id"] = assistant_node_id
         session_data["assistant_category"] = assistant_node.get("category") or user_category
 
@@ -1700,6 +1772,8 @@ def chat_with_session(user_message, session_id, reset=False):
     logger.debug(f"[ASSISTANT NODE ID] {assistant_node_id}")
     logger.debug(f"[SESSION CATEGORY PRODUCT] {session_data.get('category_product')}")
     logger.debug(f"[SESSION END] session_id={session_id}")
+
+    save_message(session_id, "assistant", final_response)
 
     return {
         "response": final_response,

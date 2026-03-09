@@ -15,6 +15,8 @@ import os
 import json
 import threading
 import sqlite3
+import re
+import logging
 load_dotenv()
 
 openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -24,6 +26,8 @@ client = OpenAI(
     api_key=openai_api_key
 )
 app = Flask(__name__)
+logger = logging.getLogger("FLASK_API")
+logger.setLevel(logging.DEBUG)
 
 @app.route("/", methods=["GET"])
 def home():
@@ -268,9 +272,6 @@ def run_pipeline():
 # ==========================================================================================================
 # ==========================================================================================================
 
-from response_claude import chat_with_session, load_flow_and_embeddings
-load_flow_and_embeddings() 
-
 # ==========================
 # ANALYSIS DB SETUP
 # ==========================
@@ -297,9 +298,9 @@ def init_analysis_db():
             match_type TEXT,
             best_similarity REAL,
             best_user_node_id TEXT,
-            top_5_user_nodes TEXT,
 
-            assistant_node_id TEXT,
+            assistant_candidates TEXT,
+            best_assistant_node_id TEXT,
             assistant_intent TEXT,
             assistant_category TEXT,
                 
@@ -335,8 +336,19 @@ def init_analysis_db():
         )
     """)
 
+    cur.execute("PRAGMA table_info(chat_analysis)")
+    existing_columns = {row[1] for row in cur.fetchall()}
+    added_columns = []
+    if "best_assistant_node_id" not in existing_columns:
+        cur.execute("ALTER TABLE chat_analysis ADD COLUMN best_assistant_node_id TEXT")
+        added_columns.append("best_assistant_node_id")
+    if "assistant_candidates" not in existing_columns:
+        cur.execute("ALTER TABLE chat_analysis ADD COLUMN assistant_candidates TEXT")
+        added_columns.append("assistant_candidates")
+
     db.commit()
     db.close()
+    logger.debug(f"[ANALYSIS DB] initialized | added_columns={added_columns}")
 
 def log_analysis_data(session_id, user_message, response, debug_info):
     try:
@@ -355,9 +367,9 @@ def log_analysis_data(session_id, user_message, response, debug_info):
                 match_type,
                 best_similarity,
                 best_user_node_id,
-                top_5_user_nodes,
 
-                assistant_node_id,
+                assistant_candidates,
+                best_assistant_node_id,
                 assistant_intent,
                 assistant_category,
 
@@ -399,9 +411,9 @@ def log_analysis_data(session_id, user_message, response, debug_info):
             debug_info.get("match_type"),
             debug_info.get("best_similarity"),
             debug_info.get("best_user_node_id"),
-            json.dumps(debug_info.get("top_5_user_nodes", [])),
 
-            debug_info.get("assistant_node_id"),
+            json.dumps(debug_info.get("assistant_candidates", [])),
+            debug_info.get("best_assistant_node_id"),
             debug_info.get("assistant_intent"),
             debug_info.get("assistant_category"),
 
@@ -432,6 +444,11 @@ def log_analysis_data(session_id, user_message, response, debug_info):
         ))
 
         db.commit()
+        logger.debug(
+            f"[ANALYSIS LOGGED] session_id={session_id} "
+            f"best_user_node_id={debug_info.get('best_user_node_id')} "
+            f"best_assistant_node_id={debug_info.get('best_assistant_node_id')}"
+        )
         db.close()
 
     except Exception as e:
@@ -439,7 +456,206 @@ def log_analysis_data(session_id, user_message, response, debug_info):
         print(f"[ERROR] Failed to log analysis data: {e}")
         print(traceback.format_exc())
 
+def _get_next_node_id(cur):
+    cur.execute("SELECT node_id FROM flow_nodes")
+    max_num = 0
+    for (node_id,) in cur.fetchall():
+        match = re.search(r"(\d+)$", str(node_id))
+        if match:
+            max_num = max(max_num, int(match.group(1)))
+    return f"N{max_num + 1}"
+
+def _insert_flow_node(cur, node_id, intent, category, role):
+    cur.execute(
+        """
+        INSERT INTO flow_nodes (node_id, intent, category, role)
+        VALUES (?, ?, ?, ?)
+        """,
+        (node_id, intent, category, role)
+    )
+
+def _insert_flow_text_if_missing(cur, node_id, chat_text, priority=10):
+    cur.execute(
+        """
+        SELECT 1 FROM flow_texts
+        WHERE node_id = ? AND chat = ?
+        """,
+        (node_id, chat_text)
+    )
+    if cur.fetchone():
+        return False
+
+    cur.execute(
+        """
+        INSERT INTO flow_texts (node_id, chat, priority)
+        VALUES (?, ?, ?)
+        """,
+        (node_id, chat_text, priority)
+    )
+    return True
+
+def _insert_flow_answer_if_missing(cur, from_node_id, intent, to_node_id):
+    cur.execute(
+        """
+        SELECT 1 FROM flow_answers
+        WHERE from_node_id = ? AND intent = ? AND to_node_id = ?
+        """,
+        (from_node_id, intent, to_node_id)
+    )
+    if cur.fetchone():
+        return False
+
+    cur.execute(
+        """
+        INSERT INTO flow_answers (from_node_id, intent, to_node_id)
+        VALUES (?, ?, ?)
+        """,
+        (from_node_id, intent, to_node_id)
+    )
+    return True
+
+def _upsert_intent_embedding(node_id, intent_text):
+    if not node_id or not intent_text:
+        return False
+
+    try:
+        emb_resp = client.embeddings.create(
+            model="text-embedding-3-large",
+            input=intent_text
+        )
+        embedding = emb_resp.data[0].embedding
+        if not embedding:
+            return False
+
+        emb_db = get_db("output/intent_embeddings.db")
+        emb_cur = emb_db.cursor()
+        emb_cur.execute("""
+            CREATE TABLE IF NOT EXISTS intent_embeddings (
+                node_id TEXT PRIMARY KEY,
+                intent TEXT,
+                embedding TEXT
+            )
+        """)
+        emb_cur.execute(
+            """
+            INSERT OR REPLACE INTO intent_embeddings (node_id, intent, embedding)
+            VALUES (?, ?, ?)
+            """,
+            (node_id, intent_text, json.dumps(embedding))
+        )
+        emb_db.commit()
+        emb_db.close()
+        return True
+    except Exception as e:
+        print(f"[WARN] Failed upsert intent embedding for node_id={node_id}: {e}")
+        print(traceback.format_exc())
+        return False
+
+def sync_optional_output_to_global_flow(user_message, debug_info):
+    if not debug_info:
+        logger.debug("[FLOW SYNC] skipped: debug_info empty")
+        return None
+
+    if not debug_info.get("used_optional_llm"):
+        logger.debug("[FLOW SYNC] skipped: used_optional_llm=False")
+        return None
+
+    optional_output = (debug_info.get("optional_llm_output") or "").strip()
+    user_message_clean = (user_message or "").strip()
+    if not optional_output or not user_message_clean:
+        logger.debug("[FLOW SYNC] skipped: optional_output or user_message empty")
+        return None
+
+    user_intent = debug_info.get("user_intent") or "user_optional_llm_autogen"
+    user_category = debug_info.get("user_category") or "follow_up"
+    assistant_intent = debug_info.get("assistant_intent") or "assistant_optional_llm_autogen"
+    assistant_category = debug_info.get("assistant_category") or user_category
+
+    best_user_node_id = debug_info.get("best_user_node_id")
+    assistant_node_id = debug_info.get("best_assistant_node_id")
+
+    db = get_db("output/global_flow.db")
+    cur = db.cursor()
+
+    created_nodes = []
+    inserted_texts = 0
+    inserted_answers = 0
+    upserted_intent_embeddings = 0
+
+    try:
+        logger.debug(
+            f"[FLOW SYNC] start best_user_node_id={best_user_node_id} "
+            f"best_assistant_node_id={assistant_node_id}"
+        )
+        # Case 1: best user node tidak ada -> buat user & assistant node baru
+        if not best_user_node_id:
+            best_user_node_id = _get_next_node_id(cur)
+            _insert_flow_node(cur, best_user_node_id, user_intent, user_category, "user")
+            created_nodes.append(best_user_node_id)
+
+            assistant_node_id = _get_next_node_id(cur)
+            _insert_flow_node(cur, assistant_node_id, assistant_intent, assistant_category, "assistant")
+            created_nodes.append(assistant_node_id)
+
+            if _insert_flow_answer_if_missing(cur, best_user_node_id, assistant_intent, assistant_node_id):
+                inserted_answers += 1
+
+        # Case 2: best user node ada tapi assistant node belum ada -> buat assistant node baru
+        elif not assistant_node_id:
+            assistant_node_id = _get_next_node_id(cur)
+            _insert_flow_node(cur, assistant_node_id, assistant_intent, assistant_category, "assistant")
+            created_nodes.append(assistant_node_id)
+
+            if _insert_flow_answer_if_missing(cur, best_user_node_id, assistant_intent, assistant_node_id):
+                inserted_answers += 1
+
+        if _insert_flow_text_if_missing(cur, best_user_node_id, user_message_clean, priority=10):
+            inserted_texts += 1
+
+        if assistant_node_id and _insert_flow_text_if_missing(cur, assistant_node_id, optional_output, priority=10):
+            inserted_texts += 1
+
+        db.commit()
+
+        # Upsert intent embeddings for nodes involved.
+        if _upsert_intent_embedding(best_user_node_id, user_intent):
+            upserted_intent_embeddings += 1
+        if assistant_node_id and _upsert_intent_embedding(assistant_node_id, assistant_intent):
+            upserted_intent_embeddings += 1
+
+        # Update debug_info supaya analysis.db menyimpan node id terbaru
+        debug_info["best_user_node_id"] = best_user_node_id
+        debug_info["best_assistant_node_id"] = assistant_node_id
+        debug_info["assistant_intent"] = assistant_intent
+        debug_info["assistant_category"] = assistant_category
+
+        logger.debug(
+            f"[FLOW SYNC] done created_nodes={created_nodes} "
+            f"inserted_texts={inserted_texts} inserted_answers={inserted_answers} "
+            f"upserted_embeddings={upserted_intent_embeddings}"
+        )
+        return {
+            "created_nodes": created_nodes,
+            "inserted_texts": inserted_texts,
+            "inserted_answers": inserted_answers,
+            "upserted_intent_embeddings": upserted_intent_embeddings
+        }
+    except Exception as e:
+        db.rollback()
+        print(f"[ERROR] Failed sync optional output to global flow: {e}")
+        print(traceback.format_exc())
+        return {
+            "error": str(e)
+        }
+    finally:
+        db.close()
+
 init_analysis_db()
+
+
+# ==========================================================================================================
+from response_claude import chat_with_session, load_flow_and_embeddings
+load_flow_and_embeddings() 
 
 # ==========================
 # CHAT ENDPOINT
@@ -450,6 +666,10 @@ def chat():
     message = data.get("message")
     session_id = data.get("session_id")
     reset = data.get("reset", False)
+    logger.debug(
+        f"[CHAT REQUEST] session_id={session_id} reset={reset} "
+        f"message_preview='{str(message)[:80] if message else ''}'"
+    )
 
     if not message:
         return jsonify({"error": "message required"}), 400
@@ -463,7 +683,15 @@ def chat():
 
     # Log to analysis.db
     debug_info = result.get("debug", {})
+    flow_sync = sync_optional_output_to_global_flow(message, debug_info)
+    if flow_sync:
+        debug_info["global_flow_sync"] = flow_sync
     log_analysis_data(session_id, message, result["response"], debug_info)
+    logger.debug(
+        f"[CHAT RESPONSE] session_id={session_id} "
+        f"best_user_node_id={debug_info.get('best_user_node_id')} "
+        f"best_assistant_node_id={debug_info.get('best_assistant_node_id')}"
+    )
 
     return jsonify({
         "response": result["response"],

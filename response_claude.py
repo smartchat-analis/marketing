@@ -7,6 +7,7 @@ import logging
 import requests
 import ast
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 from collections import OrderedDict
 from dotenv import load_dotenv
@@ -50,11 +51,13 @@ client = OpenAI(
 claude_client = anthropic.Anthropic(
     api_key=anthropic_api_key
 )
+SMARTCHAT_API = "https://smartchat2.edakarya.com/api/get-latest-chat"
+SMARTCHAT_TOKEN = "bduahdoawdwd9d9u308rf802f824hf8240h28gh8024g0824hg082h8"
 SESSION_STORE = {}
 SESSION_LOCK = threading.Lock()
 MESSAGE_BUFFER = {}
 BUFFER_LOCK = threading.Lock()
-DEBOUNCE_SECONDS = 1
+DEBOUNCE_SECONDS = 30
 
 # ======================
 # LOAD DATA
@@ -149,9 +152,6 @@ def load_flow_and_embeddings():
 # ======================
 # UTILS
 # ======================
-def normalize_text(t: str):
-    return re.sub(r"\s+", " ", t.lower().strip())
-
 def trim_text_by_char(text, max_chars=15000):
     if not text:
         return text
@@ -181,6 +181,16 @@ def safe_parse_json(text):
             pass
 
     return None
+
+def normalize_category_product(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        v = value.strip()
+        return [v] if v else []
+    return []
 
 def embed_text(text: str, max_retries: int = 3):
     logger.debug(f"[EMBED] Request received | text_preview='{text[:50]}'")
@@ -224,23 +234,6 @@ def embed_text(text: str, max_retries: int = 3):
 
     logger.critical("[EMBED FAILED] All retries exhausted")
     raise RuntimeError("Embedding generation failed") from last_exception
-
-def get_top_priority_candidates(candidates, top_k=5):
-    if not candidates:
-        return []
-    for c in candidates:
-        similarity = c.get("similarity", 0.0)
-        priority = c.get("priority", 0)
-        c["final_score"] = (
-            0.7 * similarity +
-            0.3 * priority
-        )
-    candidates_sorted = sorted(
-        candidates,
-        key=lambda x: x["final_score"],
-        reverse=True
-    )
-    return candidates_sorted[:top_k]
 
 def get_price_context(category_product_list):
     price_chunks = []
@@ -309,88 +302,6 @@ def get_product_knowledge(category_product_list):
             knowledge_chunks.append(KNOWLEDGE_LAINNYA)
 
     return "\n\n".join(knowledge_chunks)
-
-# ===============================
-# ITERATIVE RAG RETRIEVAL ENGINE
-# ===============================
-def iterative_node_search(
-    user_vec,
-    user_message,
-    user_category,
-    prev_node_id,
-    assistant_category,
-    max_attempts=5
-):
-    threshold = 0.45
-
-    logger.debug("========== ITERATIVE RAG START ==========")
-    logger.debug(f"[ITERATIVE] user_message='{user_message}'")
-    logger.debug(f"[ITERATIVE] initial_threshold={round(threshold,3)}")
-    logger.debug(f"[ITERATIVE] max_attempts={max_attempts}")
-
-    for attempt in range(1, max_attempts + 1):
-
-        logger.debug(f"----- Attempt {attempt} -----")
-        logger.debug(f"[ITERATIVE] threshold={round(threshold,3)}")
-
-        best, metadata = find_best_user_node(
-            user_vec,
-            user_message,
-            user_category=user_category,
-            prev_node_id=prev_node_id,
-            assistant_category=assistant_category,
-            custom_threshold=threshold
-        )
-
-        flow_count = metadata.get("flow_count")
-        global_count = metadata.get("global_count")
-
-        logger.debug(f"[ITERATIVE] flow_candidates={flow_count}")
-        logger.debug(f"[ITERATIVE] global_candidates={global_count}")
-
-        if best:
-            logger.debug(
-                f"[ITERATIVE SUCCESS] attempt={attempt} | "
-                f"node_id={best[0]} | "
-                f"similarity={round(best[1],3)} | "
-                f"source={best[2]}"
-            )
-            logger.debug("========== ITERATIVE RAG END ==========")
-            return best, metadata
-
-        logger.debug(f"[ITERATIVE] No match on attempt {attempt}")
-
-        # turunkan threshold bertahap
-        threshold *= 0.9
-
-    # ===============================
-    # FINAL FALLBACK (FORCE BEST MATCH)
-    # ===============================
-    logger.debug("----- FINAL FALLBACK -----")
-    logger.debug("[ITERATIVE] Forcing best similarity without threshold")
-
-    best, metadata = find_best_user_node(
-        user_vec,
-        user_message,
-        user_category=None,
-        prev_node_id=None,
-        assistant_category=None,
-        custom_threshold=0.45
-    )
-
-    if best:
-        logger.debug(
-            f"[ITERATIVE FALLBACK RESULT] "
-            f"node_id={best[0]} | "
-            f"similarity={round(best[1],3)} | "
-            f"source={best[2]}"
-        )
-    else:
-        logger.debug("[ITERATIVE FALLBACK RESULT] No node found at all")
-
-    logger.debug("========== ITERATIVE RAG END ==========")
-
-    return best, metadata
 
 # ===========================
 # LLM 2 LAYER
@@ -1134,17 +1045,190 @@ def call_intent_and_category(user_message, role, context_messages):
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0
         )
-        raw = resp.choices[0].message.content
-        match = re.search(r"\{.*\}", raw, re.S)
-        parsed = json.loads(match.group(0))
-        return parsed.get("intent", "lainnya"), parsed.get("category", None)
+        raw = (resp.choices[0].message.content or "").strip()
+        parsed = safe_parse_json(raw)
+        if not parsed:
+            match = re.search(r"\{[\s\S]*\}", raw)
+            parsed = safe_parse_json(match.group(0)) if match else None
+
+        if not isinstance(parsed, dict):
+            logger.warning("[INTENT CLASSIFIER] invalid JSON output, fallback default")
+            return "lainnya", None
+
+        intent = parsed.get("intent", "lainnya")
+        category = parsed.get("category", None)
+        return intent, category
     except Exception as e:
         logging.error(f"Intent and category classification failed: {e}")
         return "lainnya", None
 
-# ============
-# CORE LOGIC
-# ============
+def all_intent_and_category(user_message, role, context_messages=None):
+    return call_intent_and_category(user_message, role, context_messages or [])
+
+def get_assistant_candidates_from_user_node(user_node_id):
+    node = NODES.get(user_node_id, {})
+    if not node or node.get("role") != "user":
+        return []
+
+    candidates = []
+    seen = set()
+    for _, edges in node.get("answers", {}).items():
+        for e in edges:
+            assistant_node_id = e.get("to")
+            if not assistant_node_id or assistant_node_id in seen:
+                continue
+            assistant_node = NODES.get(assistant_node_id, {})
+            if assistant_node.get("role") != "assistant":
+                continue
+            seen.add(assistant_node_id)
+            candidates.append({
+                "assistant_node_id": assistant_node_id,
+                "assistant_intent": assistant_node.get("intent"),
+                "assistant_category": assistant_node.get("category"),
+                "texts": sorted(
+                    assistant_node.get("texts", []),
+                    key=lambda t: t.get("priority", 0),
+                    reverse=True
+                )[:5]
+            })
+    return candidates
+
+def score_assistant_candidate_with_llm(user_message, user_intent, candidate, context_messages=None):
+    assistant_node_id = candidate["assistant_node_id"]
+    assistant_text_preview = "\n".join(
+        f"- {t.get('chat', '')}"
+        for t in candidate.get("texts", [])
+    )
+    assistant_text_preview = trim_text_by_char(assistant_text_preview, 6000)
+    context_block = ""
+    if context_messages:
+        context_block = "\n".join(
+            f"{m.get('role')}: {m.get('content')}"
+            for m in context_messages[-10:]
+            if m.get("content")
+        )
+        context_block = trim_text_by_char(context_block, 3000)
+
+    prompt = f"""
+    Anda adalah evaluator routing assistant node.
+    Tugas: beri skor kecocokan kandidat assistant node untuk dijadikan knowledge context jawaban user saat ini.
+    Fokus pada relevansi konteks percakapan terakhir, kesesuaian intent, dan ketepatan isi teks assistant.
+
+    CONTEXT MESSAGES (riwayat terbaru, untuk kesinambungan konteks):
+    {context_block if context_block else "(tidak ada)"}
+
+    USER MESSAGE:
+    {user_message}
+
+    USER INTENT:
+    {user_intent}
+
+    ASSISTANT NODE ID:
+    {assistant_node_id}
+
+    ASSISTANT INTENT:
+    {candidate.get("assistant_intent")}
+
+    ASSISTANT CATEGORY:
+    {candidate.get("assistant_category")}
+
+    ASSISTANT TEXTS (TOP PRIORITY):
+    {assistant_text_preview}
+
+    METODE PENILAIAN (WAJIB):
+    1) Relevansi terhadap USER MESSAGE (40%)
+    - Apakah isi teks kandidat menjawab kebutuhan user saat ini.
+    - Jika melenceng dari pertanyaan user, turunkan skor signifikan.
+
+    2) Kesesuaian dengan USER INTENT (30%)
+    - Apakah intent kandidat searah dengan tujuan user.
+    - Jika intent bertentangan atau beda fase percakapan, beri skor rendah.
+
+    3) Kesesuaian dengan CONTEXT MESSAGES (20%)
+    - Apakah kandidat nyambung dengan alur percakapan terbaru.
+    - Hindari kandidat yang mengulang hal tidak relevan dengan konteks terkini.
+
+    4) Kualitas isi ASSISTANT TEXTS (10%)
+    - Lebih tinggi jika spesifik, actionable, tidak ambigu, dan siap dijadikan bahan jawaban.
+    - Lebih rendah jika terlalu umum, kosong, atau tidak informatif.
+
+    ATURAN PENALTI:
+    - Jika kandidat membahas produk/layanan berbeda dari kebutuhan user -> maksimal skor 0.35.
+    - Jika kandidat hanya salam/closing tanpa menjawab kebutuhan user -> maksimal skor 0.25.
+    - Jika kandidat bertentangan jelas dengan konteks terbaru -> maksimal skor 0.20.
+
+    SKALA SKOR:
+    - 0.90-1.00: sangat tepat, langsung bisa dipakai
+    - 0.70-0.89: relevan kuat, minor gap
+    - 0.40-0.69: relevan parsial
+    - 0.00-0.39: lemah / tidak cocok
+
+    OUTPUT:
+    - Berikan output JSON saja (tanpa teks lain):
+    {{
+      "score": 0.0,
+      "reason": "alasan singkat 1 kalimat"
+    }}
+
+    CONSTRAINT:
+    - score harus float 0.0 sampai 1.0
+    - jangan gunakan markdown
+    """
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0
+        )
+        raw = resp.choices[0].message.content.strip()
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        parsed = safe_parse_json(match.group(0)) if match else None
+        score = float((parsed or {}).get("score", 0.0))
+        score = max(0.0, min(score, 1.0))
+        reason = (parsed or {}).get("reason", "")
+        return {
+            **candidate,
+            "score": score,
+            "score_reason": reason
+        }
+    except Exception as e:
+        logger.warning(f"[ASSISTANT RANKER] node={assistant_node_id} failed: {e}")
+        return {
+            **candidate,
+            "score": 0.0,
+            "score_reason": "ranker_failed"
+        }
+
+def select_best_assistant_node_parallel(user_message, user_intent, candidates, context_messages=None):
+    if not candidates:
+        return None, []
+
+    if len(candidates) == 1:
+        only = dict(candidates[0])
+        only["score"] = 1.0
+        only["score_reason"] = "single_candidate"
+        return only, [only]
+
+    max_workers = min(5, len(candidates))
+    scored = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                score_assistant_candidate_with_llm,
+                user_message,
+                user_intent,
+                candidate,
+                context_messages
+            )
+            for candidate in candidates
+        ]
+        for future in as_completed(futures):
+            scored.append(future.result())
+
+    scored.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    return scored[0], scored
+
 def find_best_user_node(
     user_vec,
     user_message,
@@ -1155,137 +1239,96 @@ def find_best_user_node(
 ):
     logger.debug("[ROUTING] Start find_best_user_node")
 
-    candidates, flow_candidates, global_candidates = [], [], []
-    threshold = custom_threshold if custom_threshold is not None else 0.45
-    user_norm = normalize_text(user_message)
+    threshold = custom_threshold if custom_threshold is not None else 0.65
+    flow_candidates = []
+    global_candidates = []
 
     logger.debug(f"[ROUTING] threshold={threshold}")
-    logger.debug(f"[ROUTING] user_category={user_category}")
     logger.debug(f"[ROUTING] prev_node_id={prev_node_id}")
 
-    # ======================
-    # FLOW FIRST
-    # ======================
     if prev_node_id and prev_node_id in NODES:
-        logger.debug("[ROUTING] Checking FLOW candidates")
-
         prev_node = NODES[prev_node_id]
-
-        for intent, edges in prev_node.get("answers", {}).items():
+        for _, edges in prev_node.get("answers", {}).items():
             for e in edges:
-                cid = e["to"]
+                node_id = e.get("to")
+                node = NODES.get(node_id)
+                if not node or node.get("role") != "user":
+                    continue
 
-                if cid in NODES and NODES[cid]["role"] == "user":
-                    best_sim = 0.0
+                emb = NODE_INTENT_EMB.get(node_id)
+                if not emb:
+                    continue
 
-                    emb = NODE_INTENT_EMB.get(cid)
-                    if not emb:
-                        continue
+                sim = cosine_similarity(user_vec, emb)
+                if sim >= threshold:
+                    flow_candidates.append({
+                        "node_id": node_id,
+                        "similarity": sim,
+                        "source": "flow"
+                    })
 
-                    sim = cosine_similarity(user_vec, emb)
-                    best_sim = sim
-
-                    if best_sim > 0:
-                        flow_candidates.append((cid, best_sim))
-
-                        if best_sim >= threshold:
-                            candidates.append((cid, best_sim, "flow"))
-
-        logger.debug(f"[ROUTING] flow_candidates_count={len(flow_candidates)}")
-
-    # ======================
-    # GLOBAL FALLBACK
-    # ======================
-    if not candidates:
-        logger.debug("[ROUTING] Checking GLOBAL candidates")
-
-        for nid, node in NODES.items():
-            if node["role"] != "user":
-                continue
-
-            node_cat = node.get("category")
-            if user_category and node_cat != user_category:
-                continue
-
-            best_sim = 0.0
-
-            emb = NODE_INTENT_EMB.get(nid)
-            if not emb:
-                continue
-
-            sim = cosine_similarity(user_vec, emb)
-            best_sim = sim
-
-            if best_sim > 0:
-                global_candidates.append((nid, best_sim))
-
-                if best_sim >= threshold:
-                    candidates.append((nid, best_sim, "global"))
-
-        logger.debug(f"[ROUTING] global_candidates_count={len(global_candidates)}")
-
-    # ======================
-    # NO MATCH
-    # ======================
-    if not candidates:
-        logger.debug("[ROUTING] No candidate matched threshold")
-
-        return None, {
+    flow_candidates.sort(key=lambda x: x["similarity"], reverse=True)
+    if flow_candidates:
+        best = flow_candidates[0]
+        return (best["node_id"], best["similarity"], best["source"]), {
             "flow_count": len(flow_candidates),
-            "global_count": len(global_candidates)
+            "global_count": 0,
+            "best_sim": best["similarity"],
+            "best_type": best["source"],
+            "best_user_node_id": best["node_id"],
+            "top_5_user_nodes": [
+                {
+                    "node_id": c["node_id"],
+                    "similarity": round(c["similarity"], 3),
+                    "source": c["source"]
+                }
+                for c in flow_candidates[:5]
+            ]
         }
 
-    # ======================
-    # SORT & PICK BEST
-    # ======================
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    best = candidates[0]
-    top_5 = candidates[:5]
-
-    logger.debug(
-        f"[ROUTING] best_node={best[0]} "
-        f"sim={round(best[1],3)} "
-        f"source={best[2]}"
-    )
-    logger.debug(f"[ROUTING] top_5={[(c[0], round(c[1],3), c[2]) for c in top_5]}")
-
-    return best, {
-        "flow_count": len(flow_candidates),
-        "global_count": len(global_candidates),
-        "best_sim": best[1],
-        "best_type": best[2],
-        "best_user_node_id": best[0],
-        "top_5_user_nodes": [
-            {
-                "node_id": cid,
-                "similarity": round(sim, 3),
-                "source": src
-            }
-            for cid, sim, src in top_5
-        ]
-    }
-
-def collect_assistant_knowledge_from_user_nodes(top_5_user_nodes):
-    knowledge_chunks = []
-
-    for item in top_5_user_nodes:
-        user_node_id = item["node_id"]
-        node = NODES.get(user_node_id)
-
-        if not node or node["role"] != "user":
+    for node_id, node in NODES.items():
+        if node.get("role") != "user":
             continue
 
-        for _, edges in node.get("answers", {}).items():
-            for e in edges:
-                aid = e["to"]
-                if aid in NODES and NODES[aid]["role"] == "assistant":
-                    for t in NODES[aid].get("texts", []):
-                        knowledge_chunks.append({
-                            "assistant_node_id": aid,
-                            "text": t["chat"]
-                        })
+        emb = NODE_INTENT_EMB.get(node_id)
+        if not emb:
+            continue
 
-    return knowledge_chunks
+        sim = cosine_similarity(user_vec, emb)
+        if sim >= threshold:
+            global_candidates.append({
+                "node_id": node_id,
+                "similarity": sim,
+                "source": "global"
+            })
+
+    global_candidates.sort(key=lambda x: x["similarity"], reverse=True)
+    if global_candidates:
+        best = global_candidates[0]
+        return (best["node_id"], best["similarity"], best["source"]), {
+            "flow_count": 0,
+            "global_count": len(global_candidates),
+            "best_sim": best["similarity"],
+            "best_type": best["source"],
+            "best_user_node_id": best["node_id"],
+            "top_5_user_nodes": [
+                {
+                    "node_id": c["node_id"],
+                    "similarity": round(c["similarity"], 3),
+                    "source": c["source"]
+                }
+                for c in global_candidates[:5]
+            ]
+        }
+
+    return None, {
+        "flow_count": 0,
+        "global_count": 0,
+        "best_sim": 0.0,
+        "best_type": "no_match",
+        "best_user_node_id": None,
+        "top_5_user_nodes": []
+    }
 
 def resolve_assistant_node_from_best_user(best_user_node_id):
     # Fungsi helper untuk resolve assistant node dari best user node
@@ -1301,30 +1344,6 @@ def resolve_assistant_node_from_best_user(best_user_node_id):
                 return aid
     return None
 
-def get_response_from_knowledge(
-    best_user_node_id,
-    top_5_user_nodes
-):
-    knowledge = collect_assistant_knowledge_from_user_nodes(
-        top_5_user_nodes
-    )
-
-    if not knowledge:
-        return {
-            "assistant_node_id": None,
-            "knowledge_context": ""
-        }
-
-    knowledge_context = "\n".join(
-        f"- {k['text']}"
-        for k in knowledge
-    )
-
-    return {
-        "assistant_node_id": resolve_assistant_node_from_best_user(best_user_node_id),
-        "knowledge_context": knowledge_context
-    }
-
 def generate_assistant_response(
     user_message,
     user_intent=None,
@@ -1332,49 +1351,104 @@ def generate_assistant_response(
     prev_node_id=None,
     assistant_category=None,
     context_messages=None,
-    session_category_product=None  
+    session_category_product=None
 ):
+    if not isinstance(session_category_product, list):
+        session_category_product = (
+            [session_category_product] if session_category_product else []
+        )
+
     intent_vec = embed_text(user_intent)
-    best_user_node, metadata = iterative_node_search(
+    best_user_node, metadata = find_best_user_node(
         intent_vec,
-        user_message,
-        user_category,       
-        prev_node_id,
-        assistant_category 
+        user_message=user_message,
+        user_category=user_category,
+        prev_node_id=prev_node_id,
+        assistant_category=assistant_category,
+        custom_threshold=0.65
     )
 
     detected_intent = user_intent
     knowledge_context = ""
     assistant_node_id = None
-    # =========================================================
-    # DETERMINE KNOWLEDGE CONTEXT
-    # =========================================================
+
+    llm1_prompt = None
+    llm1_output = None
+    optional_llm_prompt = None
+    optional_llm_output = None
+    detected_category_product = None
+    knowledge_relevant = False
+    confidence_score = 0.0
+    used_optional_llm = False
+    raw_response = ""
+    final_category_product = list(session_category_product)
+    force_optional_llm = False
+    force_optional_for_no_user_node = False
+
     if best_user_node:
         user_node_id = best_user_node[0]
+        logger.debug(
+            f"[ROUTING] matched_user_node={user_node_id} "
+            f"sim={round(float(best_user_node[1]),3)} "
+            f"source={best_user_node[2]}"
+        )
+        detected_intent = NODES.get(user_node_id, {}).get("intent", user_intent)
+        resolved_from_best_user = resolve_assistant_node_from_best_user(user_node_id)
 
-        knowledge_data = get_response_from_knowledge(
-            best_user_node_id=user_node_id,
-            top_5_user_nodes=metadata.get("top_5_user_nodes", [])
+        assistant_candidates = get_assistant_candidates_from_user_node(user_node_id)
+        logger.debug(f"[ASSISTANT CANDIDATES] count={len(assistant_candidates)}")
+        best_assistant_candidate, scored_assistants = select_best_assistant_node_parallel(
+            user_message=user_message,
+            user_intent=detected_intent,
+            candidates=assistant_candidates,
+            context_messages=context_messages
         )
 
-        detected_intent = NODES.get(user_node_id, {}).get("intent", "")
-        knowledge_context = knowledge_data.get("knowledge_context", "")
-        assistant_node_id = knowledge_data.get("assistant_node_id")
+        metadata["assistant_candidate_scores"] = [
+            {
+                "assistant_node_id": c.get("assistant_node_id"),
+                "assistant_intent": c.get("assistant_intent"),
+                "assistant_category": c.get("assistant_category"),
+                "score": round(float(c.get("score", 0.0)), 3)
+            }
+            for c in scored_assistants
+        ]
 
-        knowledge_context = trim_text_by_char(knowledge_context, 15000)
-
-        best_similarity = metadata.get("best_sim", 0)
-
-        if best_similarity < 0.5:
+        if best_assistant_candidate:
+            assistant_node_id = best_assistant_candidate.get("assistant_node_id")
             logger.debug(
-                f"[RAG CONFIDENCE GATE] similarity={round(best_similarity,3)} < 0.5 → knowledge ignored"
+                f"[ASSISTANT SELECTED] node={assistant_node_id} "
+                f"score={round(float(best_assistant_candidate.get('score', 0.0)),3)} "
+                f"reason={best_assistant_candidate.get('score_reason', '')}"
             )
-            knowledge_context = ""
-            assistant_node_id = None
+            best_texts = [
+                t.get("chat")
+                for t in best_assistant_candidate.get("texts", [])[:5]
+                if t.get("chat")
+            ]
+            knowledge_context = "\n".join(f"- {txt}" for txt in best_texts)
+            knowledge_context = trim_text_by_char(knowledge_context, 15000)
+        elif resolved_from_best_user:
+            assistant_node_id = resolved_from_best_user
+            fallback_node = NODES.get(assistant_node_id, {})
+            fallback_texts = sorted(
+                fallback_node.get("texts", []),
+                key=lambda t: t.get("priority", 0),
+                reverse=True
+            )[:5]
+            best_texts = [
+                t.get("chat")
+                for t in fallback_texts
+                if t.get("chat")
+            ]
+            knowledge_context = "\n".join(f"- {txt}" for txt in best_texts)
+            knowledge_context = trim_text_by_char(knowledge_context, 15000)
+            metadata["assistant_resolved_fallback"] = True
+            logger.debug(f"[ASSISTANT FALLBACK RESOLVE] node={assistant_node_id}")
+    else:
+        logger.debug("[ROUTING] No user node matched threshold 0.65")
+        metadata.setdefault("assistant_candidate_scores", [])
 
-    # =========================================================
-    # CALL LLM1
-    # =========================================================
     llm_result = llm_validate_and_generate(
         user_message=user_message,
         user_intent=detected_intent,
@@ -1389,66 +1463,49 @@ def generate_assistant_response(
     detected_category_product = llm_result.get("category_product")
     llm1_prompt = llm_result.get("prompt")
     llm1_output = llm_result.get("raw_output")
-    optional_llm_output = None
 
-    # =========================================================
-    # PRODUCT MEMORY LOGIC
-    # =========================================================
-
-    # Pastikan session_category_product selalu list
-    if not isinstance(session_category_product, list):
-        session_category_product = (
-            [session_category_product] if session_category_product else []
-        )
-
+    detected_list = normalize_category_product(detected_category_product)
     if detected_category_product == "__PARSING_ERROR__":
-        # Parsing gagal → pakai memory lama
-        final_category_product = session_category_product
-
-    elif detected_category_product is None:
-        # Tidak ada produk baru → pertahankan memory lama
-        final_category_product = session_category_product
-
-    elif isinstance(detected_category_product, list):
-
-        # Merge tanpa duplikasi
-        merged = session_category_product.copy()
-
-        for cat in detected_category_product:
+        final_category_product = list(session_category_product)
+    elif detected_list:
+        merged = list(session_category_product)
+        for cat in detected_list:
             if cat not in merged:
                 merged.append(cat)
-
         final_category_product = merged
-
     else:
-        # Unexpected format → fallback aman
-        final_category_product = session_category_product
-
-    # =========================================================
-    # OPTIONAL CALL LLM PRODUCT-AWARE REGENERATE
-    # =========================================================
-    used_optional_llm = False
-    optional_llm_prompt = None
+        final_category_product = list(session_category_product)
 
     knowledge_relevant = llm_result.get("knowledge_relevant")
     confidence_score = float(llm_result.get("confidence_score", 0.0))
     force_optional_llm = llm_result.get("force_optional_llm", False)
 
-    has_active_product_signal = (
-        detected_category_product
-        and detected_category_product != "__PARSING_ERROR__"
-    )
+    has_active_product_signal = len(final_category_product) > 0
+    if not best_user_node and has_active_product_signal:
+        force_optional_for_no_user_node = True
+
+    optional_trigger_reasons = []
+    if force_optional_llm:
+        optional_trigger_reasons.append("llm1_force_optional")
+    if force_optional_for_no_user_node:
+        optional_trigger_reasons.append("no_user_node_with_product")
+    if knowledge_relevant is False:
+        optional_trigger_reasons.append("knowledge_not_relevant")
+    if confidence_score < 0.80:
+        optional_trigger_reasons.append("low_confidence")
+    if not assistant_node_id:
+        optional_trigger_reasons.append("assistant_node_missing")
 
     if (
         has_active_product_signal
-        and final_category_product
         and (
             force_optional_llm
+            or force_optional_for_no_user_node
             or knowledge_relevant is False
             or confidence_score < 0.80
+            or not assistant_node_id
         )
     ):
-
         optional_response = llm_optional_product_regenerate(
             user_message=user_message,
             user_intent=detected_intent,
@@ -1456,16 +1513,22 @@ def generate_assistant_response(
             category_product=final_category_product,
             previous_response=raw_response
         )
+        logger.debug(
+            f"[OPTIONAL LLM] triggered reasons={optional_trigger_reasons} "
+            f"category={final_category_product}"
+        )
 
         if optional_response:
             raw_response = optional_response.get("response")
             optional_llm_prompt = optional_response.get("prompt")
             optional_llm_output = optional_response.get("raw_output")
             used_optional_llm = True
+    else:
+        logger.debug(
+            f"[OPTIONAL LLM] skipped has_product={has_active_product_signal} "
+            f"reasons={optional_trigger_reasons}"
+        )
 
-    # =========================================================
-    # CALL LLM2
-    # =========================================================
     raw_response = str(raw_response) if raw_response is not None else ""
 
     sanitized = sanitize_llm_response(
@@ -1493,18 +1556,42 @@ def generate_assistant_response(
     logger.debug(f"[FINAL CATEGORY PRODUCT] {final_category_product}")
     logger.debug(
         f"[PIPELINE SUMMARY] "
-        f"LLM1 -> OPTIONAL({used_optional_llm}) -> LLM2 | "
+        f"ROUTING_V2 -> LLM1/OPTIONAL -> LLM2 | "
         f"confidence={confidence_score} | "
         f"category={final_category_product}"
     )
-    # =========================================================
-    # RETURN
-    # =========================================================
+
+    resolved_assistant_intent = None
+    resolved_assistant_category = None
+
+    if not assistant_node_id:
+        assistant_context = list(context_messages or [])
+        assistant_context.append({
+            "role": "user",
+            "content": user_message
+        })
+        resolved_assistant_intent, resolved_assistant_category = all_intent_and_category(
+            final_response,
+            "assistant",
+            assistant_context
+        )
+
+        logger.debug(
+            f"[ASSISTANT FALLBACK CLASSIFIER] "
+            f"intent={resolved_assistant_intent} | "
+            f"category={resolved_assistant_category}"
+        )
+
+        if not resolved_assistant_intent:
+            resolved_assistant_intent = "assistant_generated_response"
+        if not resolved_assistant_category:
+            resolved_assistant_category = user_category or "conversational_closing"
+
     return {
         "response": final_response,
         "node_id": assistant_node_id,
         "metadata": metadata,
-        "category_product": final_category_product,
+        "category_product": normalize_category_product(final_category_product),
         "knowledge_relevant": knowledge_relevant,
         "confidence_score": confidence_score,
         "used_optional_llm": used_optional_llm,
@@ -1516,9 +1603,10 @@ def generate_assistant_response(
         "price_corrected": sanitized.get("price_corrected"),
         "llm1_output": llm1_output,
         "optional_llm_output": optional_llm_output,
-        "llm2_output": llm2_output
+        "llm2_output": llm2_output,
+        "resolved_assistant_intent": resolved_assistant_intent,
+        "resolved_assistant_category": resolved_assistant_category
     }
-
 # ======================
 # SAVE MESSAGE TO DB
 # ======================
@@ -1534,27 +1622,96 @@ def save_message(session_id, role, content):
     conn.commit()
     conn.close()
 
-def load_recent_messages(session_id, limit=10):
-    conn = get_db("output/analysis.db")
-    cur = conn.cursor()
+# ==================================
+# LOAD HISTORY CHAT FROM SMARTCHAT
+# ==================================
+def load_smartchat_history(conversation_id, limit=10):
+    fetch_limit = limit * 5  
 
-    cur.execute("""
-        SELECT role, chat
-        FROM session_history
-        WHERE session_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-    """, (session_id, limit))
+    logger.debug(f"[SMARTCHAT] Requesting history")
+    logger.debug(f"[SMARTCHAT] conversation_id={conversation_id}, fetch_limit={fetch_limit}")
 
-    rows = cur.fetchall()
-    conn.close()
+    params = {
+        "conversation_id": conversation_id,
+        "limit": fetch_limit
+    }
+    headers = {
+        "Authorization": f"Bearer {SMARTCHAT_TOKEN}"
+    }
 
-    rows.reverse()
+    try:
+        response = requests.get(
+            SMARTCHAT_API,
+            params=params,
+            headers=headers,
+            timeout=10
+        )
 
-    return [
-        {"role": r[0], "content": r[1]}
-        for r in rows
-    ]
+        logger.debug(f"[SMARTCHAT] Status Code: {response.status_code}")
+        logger.debug(f"[SMARTCHAT] Raw Response: {response.text}")
+
+        if response.status_code != 200:
+            logger.error("[SMARTCHAT] API returned non-200 status")
+            return []
+        data = response.json()
+
+    except Exception as e:
+        logger.error(f"[SMARTCHAT] API request failed: {str(e)}")
+        return []
+
+    messages = data.get("last_chat", [])
+    history = []
+
+    logger.debug(f"[SMARTCHAT] Total messages received: {len(messages)}")
+
+    for i, msg in enumerate(messages):
+        role = msg.get("role")
+        content = msg.get("chat")
+
+        # 1. filter role
+        if role not in ["user", "assistant"]:
+            continue
+
+        # 2. filter assistant REM
+        if role == "assistant":
+            need_confirmation = msg.get("need_confirmation", 1)
+            is_delivered = msg.get("is_delivered", 0)
+            if need_confirmation != 0 or is_delivered != 1:
+                continue
+
+        # 3. filter kosong
+        if not content:
+            continue
+        history.append({
+            "role": role,
+            "content": content.strip()
+        })
+
+    logger.debug(f"[SMARTCHAT] History before reverse: {history}")
+
+    history.reverse()
+
+    # MERGE SAME ROLE CHAT
+    merged_history = []
+    for msg in history:
+        if not merged_history:
+            merged_history.append(msg)
+            continue
+        last_msg = merged_history[-1]
+
+        if msg["role"] == last_msg["role"]:
+            last_msg["content"] += "\n" + msg["content"]
+        else:
+            merged_history.append(msg)
+
+    logger.debug(f"[SMARTCHAT] History after merge: {merged_history}")
+
+    # AMBIL 10 CHAT TERAKHIR
+    final_history = merged_history[-limit:]
+
+    logger.debug(f"[SMARTCHAT] Final history used by LLM ({len(final_history)}): {final_history}")
+
+    return final_history
 
 def process_buffered_messages(session_id):
     with BUFFER_LOCK:
@@ -1625,7 +1782,7 @@ def chat_with_session(user_message, session_id, reset=False):
         session_data = dict(SESSION_STORE.get(session_id, {}))
 
         # BUILD CONTEXT
-        context_messages = load_recent_messages(session_id, limit=10)
+        context_messages = load_smartchat_history(session_id, limit=10)
 
         # INTENT & FLOW CATEGORY (ONCE)
         user_intent, user_category = call_intent_and_category(
@@ -1691,29 +1848,37 @@ def chat_with_session(user_message, session_id, reset=False):
     knowledge_context = result.get("knowledge_context")
     sensitive_found = result.get("sensitive_found")
     price_corrected = result.get("price_corrected")
+    resolved_assistant_intent = result.get("resolved_assistant_intent")
+    resolved_assistant_category = result.get("resolved_assistant_category")
     
     assistant_node = NODES.get(assistant_node_id, {}) if assistant_node_id else {}
+    final_assistant_intent = (
+        assistant_node.get("intent")
+        or resolved_assistant_intent
+        or "assistant_generated_response"
+    )
+    final_assistant_category = (
+        assistant_node.get("category")
+        or resolved_assistant_category
+        or user_category
+        or "conversational_closing"
+    )
 
     # =================
     # UPDATE SESSION 
     # =================
     with SESSION_LOCK:
         session_data["prev_node_id"] = assistant_node_id
-        session_data["assistant_category"] = assistant_node.get("category") or user_category
-
-    # =====================================
-    # STATE MEMORY CATEGORY PRODUCT
-    # =====================================
-
-    # Gunakan hasil final dari generate_assistant_response
-    session_data["category_product"] = result.get("category_product", [])
+        session_data["assistant_category"] = final_assistant_category
+        session_data["category_product"] = normalize_category_product(
+            result.get("category_product", [])
+        )
+        SESSION_STORE[session_id] = session_data
 
     logger.debug(
         f"[PRODUCT MEMORY FINALIZED] "
         f"stored={session_data.get('category_product')}"
     )
-
-    SESSION_STORE[session_id] = session_data
 
     # ======================
     # DEBUG INFO
@@ -1726,12 +1891,12 @@ def chat_with_session(user_message, session_id, reset=False):
         "match_type": metadata.get("best_type"),
         "best_similarity": round(metadata.get("best_sim", 0), 3),
         "best_user_node_id": metadata.get("best_user_node_id"),
-        "top_5_user_nodes": metadata.get("top_5_user_nodes", []),
+        "assistant_candidates": metadata.get("assistant_candidate_scores", []),
 
         # RESULT
-        "assistant_node_id": assistant_node_id,
-        "assistant_intent": assistant_node.get("intent"),
-        "assistant_category": assistant_node.get("category") or user_category,
+        "best_assistant_node_id": assistant_node_id,
+        "assistant_intent": final_assistant_intent,
+        "assistant_category": final_assistant_category,
 
         # CATEGORY PRODUCT
         "detected_category_product": detected_category_product,
@@ -1780,3 +1945,4 @@ def chat_with_session(user_message, session_id, reset=False):
         "node_id": assistant_node_id,
         "debug": debug_info
     }
+

@@ -336,8 +336,6 @@ def init_analysis_db():
         )
     """)
 
-<<<<<<< optimasi_flow
-=======
     cur.execute("PRAGMA table_info(chat_analysis)")
     existing_columns = {row[1] for row in cur.fetchall()}
     added_columns = []
@@ -350,8 +348,6 @@ def init_analysis_db():
     if "assistant_candidates" not in existing_columns:
         cur.execute("ALTER TABLE chat_analysis ADD COLUMN assistant_candidates TEXT")
         added_columns.append("assistant_candidates")
-
->>>>>>> local
     db.commit()
     db.close()
 

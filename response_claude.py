@@ -12,6 +12,7 @@ from collections import OrderedDict
 from dotenv import load_dotenv
 import anthropic
 import sqlite3
+from website_examples import maybe_build_examples_response
 load_dotenv()
 def get_db(path):
     return sqlite3.connect(path, check_same_thread=False)
@@ -50,17 +51,11 @@ client = OpenAI(
 claude_client = anthropic.Anthropic(
     api_key=anthropic_api_key
 )
-<<<<<<< optimasi_flow
-=======
 SMARTCHAT_LATEST_CHAT_API = "https://smartchat2.edakarya.com/api/get-latest-chat"
 SMARTCHAT_DETAIL_API = "https://smartchat2.edakarya.com/api/get-conversation-detail"
 SMARTCHAT_TOKEN = "bduahdoawdwd9d9u308rf802f824hf8240h28gh8024g0824hg082h8"
->>>>>>> local
 SESSION_STORE = {}
 SESSION_LOCK = threading.Lock()
-MESSAGE_BUFFER = {}
-BUFFER_LOCK = threading.Lock()
-DEBOUNCE_SECONDS = 1
 
 # ======================
 # LOAD DATA
@@ -587,6 +582,8 @@ def llm_validate_and_generate(
     - Maximum 2 light emojis.
     - Avoid long bullet lists.
     - Do NOT explain features one by one unless explicitly requested.
+    - If the user asks for contoh/portfolio/reference website, set wants_examples = true.
+    - If the user does not ask for website examples, set wants_examples = false.
 
     =====================================================
     PRODUCT CATEGORY DETECTION (MANDATORY LOGIC)
@@ -713,6 +710,7 @@ def llm_validate_and_generate(
     =====================================================
     {{
     "response": "final short and natural WhatsApp reply",
+    "wants_examples": false,
     "category_product": null,
     "knowledge_relevant": true,
     "force_optional_llm": false,
@@ -750,6 +748,7 @@ def llm_validate_and_generate(
         logger.debug("[LLM1] JSON parsed successfully")
         return {
             "response": parsed.get("response", ""),
+            "wants_examples": parsed.get("wants_examples", False),
             "category_product": parsed.get("category_product"),
             "knowledge_relevant": parsed.get("knowledge_relevant", False),
             "force_optional_llm": parsed.get("force_optional_llm", False),
@@ -1416,12 +1415,8 @@ def generate_assistant_response(
     prev_node_id=None,
     assistant_category=None,
     context_messages=None,
-<<<<<<< optimasi_flow
-    session_category_product=None  
-=======
     session_category_product=None,
     company=None
->>>>>>> local
 ):
     intent_vec = embed_text(user_intent)
     best_user_node, metadata = iterative_node_search(
@@ -1461,11 +1456,9 @@ def generate_assistant_response(
             knowledge_context = ""
             assistant_node_id = None
 
-<<<<<<< optimasi_flow
     # =========================================================
-    # CALL LLM1
+    # FILTER KNOWLEDGE CONTEXT BY COMPANY (PAYMENT INFO)
     # =========================================================
-=======
     if company and knowledge_context:
         bank_marker = re.search(r"(?i)\b(atas nama|nomor rekening)\b", knowledge_context)
         if bank_marker:
@@ -1488,7 +1481,9 @@ def generate_assistant_response(
             else:
                 logger.debug("[PAYMENT FILTER] knowledge_context cleared due to company mismatch")
 
->>>>>>> local
+    # =========================================================
+    # CALL LLM1
+    # =========================================================
     llm_result = llm_validate_and_generate(
         user_message=user_message,
         user_intent=detected_intent,
@@ -1501,10 +1496,29 @@ def generate_assistant_response(
     logger.debug(f"[LLM1 RESULT] response_preview={str(llm_result.get('response',''))[:100]}")
 
     raw_response = llm_result.get("response", "")
+    wants_examples = bool(llm_result.get("wants_examples", False))
     detected_category_product = llm_result.get("category_product")
     llm1_prompt = llm_result.get("prompt")
     llm1_output = llm_result.get("raw_output")
     optional_llm_output = None
+    examples_replaced = False
+
+    # =========================================================
+    # REPLACE WITH DB EXAMPLES (POST-LLM1)
+    # =========================================================
+    context_summary = " | ".join(
+        f"{m['role']}: {m['content']}" for m in (context_messages or [])
+    )
+    example_result = maybe_build_examples_response(
+        user_message=user_message,
+        context_summary=context_summary,
+        llm1_output=raw_response,
+        company=company,
+        wants_examples=wants_examples
+    )
+    if example_result and example_result.get("response"):
+        raw_response = example_result["response"]
+        examples_replaced = True
 
     # =========================================================
     # PRODUCT MEMORY LOGIC
@@ -1557,6 +1571,7 @@ def generate_assistant_response(
     if (
         has_active_product_signal
         and final_category_product
+        and not examples_replaced
         and (
             force_optional_llm
             or knowledge_relevant is False
@@ -1603,6 +1618,7 @@ def generate_assistant_response(
     final_response = re.sub(r"\*{2,}(.*?)\*{2,}", r"*\1*", final_response)
     final_response = re.sub(r'\n+', '\n', final_response)
     final_response = re.sub(r'\.\s+([\U0001F300-\U0001FAFF])', r'\1', final_response)
+    final_response = _restore_atas_nama_from_prompt_fallback(final_response)
     llm2_prompt = sanitized.get("prompt")
     llm2_output = sanitized.get("raw_output")
 
@@ -1652,9 +1668,63 @@ def save_message(session_id, role, content):
     conn.close()
 
 def load_recent_messages(session_id, limit=10):
+    # 1) Prefer Smartchat history (authoritative)
+    try:
+        params = {
+            "conversation_id": session_id,
+            "limit": limit * 5
+        }
+        headers = {
+            "Authorization": f"Bearer {SMARTCHAT_TOKEN}"
+        }
+        resp = requests.get(
+            SMARTCHAT_LATEST_CHAT_API,
+            params=params,
+            headers=headers,
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            messages = data.get("last_chat", []) or []
+            history = []
+            for msg in messages:
+                role = msg.get("role")
+                content = msg.get("chat")
+                if role not in ["user", "assistant"]:
+                    continue
+                if role == "assistant":
+                    need_confirmation = msg.get("need_confirmation", 1)
+                    is_delivered = msg.get("is_delivered", 0)
+                    if need_confirmation != 0 or is_delivered != 1:
+                        continue
+                if not content:
+                    continue
+                history.append({
+                    "role": role,
+                    "content": content.strip()
+                })
+
+            history.reverse()
+
+            # Merge consecutive same-role messages
+            merged = []
+            for msg in history:
+                if not merged:
+                    merged.append(msg)
+                    continue
+                last = merged[-1]
+                if msg["role"] == last["role"]:
+                    last["content"] += "\n" + msg["content"]
+                else:
+                    merged.append(msg)
+
+            return merged[-limit:]
+    except Exception as e:
+        logger.warning(f"[SMARTCHAT] load_recent_messages failed: {e}")
+
+    # 2) Fallback to local session_history
     conn = get_db("output/analysis.db")
     cur = conn.cursor()
-
     cur.execute("""
         SELECT role, chat
         FROM session_history
@@ -1662,26 +1732,10 @@ def load_recent_messages(session_id, limit=10):
         ORDER BY id DESC
         LIMIT ?
     """, (session_id, limit))
-
     rows = cur.fetchall()
     conn.close()
-
-<<<<<<< optimasi_flow
     rows.reverse()
-=======
-    try:
-        response = requests.get(
-            SMARTCHAT_LATEST_CHAT_API,
-            params=params,
-            headers=headers,
-            timeout=10
-        )
->>>>>>> local
-
-    return [
-        {"role": r[0], "content": r[1]}
-        for r in rows
-    ]
+    return [{"role": r[0], "content": r[1]} for r in rows]
 
 def _find_first_key(obj, keys):
     if isinstance(obj, dict):
@@ -1739,6 +1793,33 @@ def _split_knowledge_blocks(knowledge_context):
     return blocks
 
 
+def _restore_atas_nama_from_prompt_fallback(text):
+    if not text or "{{$company}}" not in text:
+        return text
+    # Use ONLY the main payment accounts from LLM1 prompt fallback.
+    fallback = {
+        "01-351-00-16-00004-3": "PT EBYB GLOBAL MARKETPLACE",
+        "878-0532239": "EBYB GLOBAL MARKETPLACE",
+        "118-00-1500440-0": "PT EBYB GLOBAL MARKETPLACE",
+        "050201000623569": "EBYB GLOBAL MARKETPLACE",
+    }
+    lines = text.splitlines()
+    current_account = None
+    for i, line in enumerate(lines):
+        acct_match = re.search(r"(?i)nomor rekening\s*:\s*([0-9\- ]+)", line)
+        if acct_match:
+            current_account = acct_match.group(1).strip()
+            continue
+        if "{{$company}}" in line and re.search(r"(?i)\batas nama\b", line):
+            if current_account and current_account in fallback:
+                lines[i] = re.sub(
+                    r"(?i)atas nama\s*:\s*\{\{\$company\}\}",
+                    f"Atas nama: {fallback[current_account]}",
+                    line
+                )
+    return "\n".join(lines)
+
+
 def fetch_smartchat_company(conversation_id):
     url = f"{SMARTCHAT_DETAIL_API}/{conversation_id}"
     headers = {
@@ -1781,61 +1862,6 @@ def fetch_smartchat_company(conversation_id):
     )
     logger.debug(f"[SMARTCHAT DETAIL] company={company}")
     return company
-
-def process_buffered_messages(session_id):
-    with BUFFER_LOCK:
-        data = MESSAGE_BUFFER.get(session_id)
-
-        if not data:
-            return None
-
-        messages = data.get("buffer", [])
-        MESSAGE_BUFFER.pop(session_id, None)
-
-    if not messages:
-        return None
-
-    combined_message = "\n".join(messages)
-
-    if not combined_message.strip():
-        return None
-
-    logger.debug(f"[DEBOUNCE PROCESS] session={session_id}")
-    logger.debug(f"[DEBOUNCE COMBINED MESSAGE]\n{combined_message}")
-
-    return chat_with_session(combined_message, session_id)
-
-def handle_incoming_message(user_message, session_id):
-
-    with BUFFER_LOCK:
-
-        if session_id not in MESSAGE_BUFFER:
-            MESSAGE_BUFFER[session_id] = {
-                "buffer": [],
-                "timer": None
-            }
-
-        # Tambah pesan ke buffer
-        MESSAGE_BUFFER[session_id]["buffer"].append(user_message)
-
-        # Cancel timer lama kalau ada
-        old_timer = MESSAGE_BUFFER[session_id]["timer"]
-        if old_timer:
-            old_timer.cancel()
-
-        # Set timer baru
-        timer = threading.Timer(
-            DEBOUNCE_SECONDS,
-            process_buffered_messages,
-            args=[session_id]
-        )
-
-        MESSAGE_BUFFER[session_id]["timer"] = timer
-        timer.start()
-
-    return {
-        "status": "waiting_for_more_messages"
-    }
 
 # ======================
 # MAIN ENTRY

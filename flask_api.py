@@ -15,6 +15,8 @@ import os
 import json
 import threading
 import sqlite3
+import re
+import logging
 load_dotenv()
 
 openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -24,6 +26,8 @@ client = OpenAI(
     api_key=openai_api_key
 )
 app = Flask(__name__)
+logger = logging.getLogger("FLASK_API")
+logger.setLevel(logging.DEBUG)
 
 @app.route("/", methods=["GET"])
 def home():
@@ -280,74 +284,87 @@ def init_analysis_db():
     os.makedirs("output", exist_ok=True)
     db = get_db("output/analysis.db")
     cur = db.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS chat_analysis (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-
-            session_id TEXT,
-            company TEXT,
-            user_message TEXT,
-            response TEXT,
-
-            -- INTENT & FLOW
-            user_intent TEXT,
-            user_category TEXT,
-
-            match_type TEXT,
-            best_similarity REAL,
-            best_user_node_id TEXT,
-            top_5_user_nodes TEXT,
-
-            assistant_node_id TEXT,
-            assistant_intent TEXT,
-            assistant_category TEXT,
-                
-            knowledge_context TEXT,
-
-            flow_candidates_count INTEGER,
-            global_candidates_count INTEGER,
-
-            context_summary TEXT,
-
-            -- PRODUCT MEMORY
-            detected_category_product TEXT,
-            session_category_product TEXT,
-
-            -- LLM SELF EVAL
-            knowledge_relevant INTEGER,
-            confidence_score REAL,
-            used_optional_llm INTEGER,
-
-            -- SANITIZE FLAGS
-            sensitive_found INTEGER,
-            price_corrected INTEGER,
-
-            -- PROMPTS
-            llm1_prompt TEXT,
-            optional_llm_prompt TEXT,
-            llm2_prompt TEXT,
-            
-            -- LLM OUTPUT
-            llm1_output TEXT,
-            optional_llm_output TEXT,
-            llm2_output TEXT
-        )
-    """)
+    desired_columns = [
+        ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+        ("timestamp", "DATETIME DEFAULT CURRENT_TIMESTAMP"),
+        ("session_id", "TEXT"),
+        ("company", "TEXT"),
+        ("user_message", "TEXT"),
+        ("response", "TEXT"),
+        ("user_intent", "TEXT"),
+        ("user_category", "TEXT"),
+        ("match_type", "TEXT"),
+        ("best_similarity", "REAL"),
+        ("best_user_node_id", "TEXT"),
+        ("best_assistant_node_id", "TEXT"),
+        ("assistant_candidates", "TEXT"),
+        ("assistant_intent", "TEXT"),
+        ("assistant_category", "TEXT"),
+        ("knowledge_context", "TEXT"),
+        ("flow_candidates_count", "INTEGER"),
+        ("global_candidates_count", "INTEGER"),
+        ("context_summary", "TEXT"),
+        ("detected_category_product", "TEXT"),
+        ("session_category_product", "TEXT"),
+        ("knowledge_relevant", "INTEGER"),
+        ("confidence_score", "REAL"),
+        ("used_optional_llm", "INTEGER"),
+        ("sensitive_found", "INTEGER"),
+        ("price_corrected", "INTEGER"),
+        ("wants_examples", "INTEGER"),
+        ("website_examples_used", "INTEGER"),
+        ("negotiated_price_detected", "INTEGER"),
+        ("negotiated_price_value", "TEXT"),
+        ("llm1_prompt", "TEXT"),
+        ("optional_llm_prompt", "TEXT"),
+        ("llm2_prompt", "TEXT"),
+        ("llm1_output", "TEXT"),
+        ("optional_llm_output", "TEXT"),
+        ("llm2_output", "TEXT")
+    ]
+    desired_column_names = [name for name, _ in desired_columns]
 
     cur.execute("PRAGMA table_info(chat_analysis)")
-    existing_columns = {row[1] for row in cur.fetchall()}
-    added_columns = []
-    if "company" not in existing_columns:
-        cur.execute("ALTER TABLE chat_analysis ADD COLUMN company TEXT")
-        added_columns.append("company")
-    if "best_assistant_node_id" not in existing_columns:
-        cur.execute("ALTER TABLE chat_analysis ADD COLUMN best_assistant_node_id TEXT")
-        added_columns.append("best_assistant_node_id")
-    if "assistant_candidates" not in existing_columns:
-        cur.execute("ALTER TABLE chat_analysis ADD COLUMN assistant_candidates TEXT")
-        added_columns.append("assistant_candidates")
+    existing_info = cur.fetchall()
+
+    if not existing_info:
+        columns_sql = ",\n            ".join(f"{name} {definition}" for name, definition in desired_columns)
+        cur.execute(f"""
+            CREATE TABLE chat_analysis (
+                {columns_sql}
+            )
+        """)
+        db.commit()
+        db.close()
+        return
+
+    existing_columns = [row[1] for row in existing_info]
+    requires_rebuild = (
+        "top_5_user_nodes" in existing_columns
+        or "assistant_node_id" in existing_columns
+        or any(name not in existing_columns for name in desired_column_names if name not in {"id", "timestamp"})
+    )
+
+    if requires_rebuild:
+        columns_sql = ",\n            ".join(f"{name} {definition}" for name, definition in desired_columns)
+        cur.execute("ALTER TABLE chat_analysis RENAME TO chat_analysis_old")
+        cur.execute(f"""
+            CREATE TABLE chat_analysis (
+                {columns_sql}
+            )
+        """)
+
+        old_columns = set(existing_columns)
+        copy_columns = [name for name in desired_column_names if name in old_columns]
+        if copy_columns:
+            column_list = ", ".join(copy_columns)
+            cur.execute(f"""
+                INSERT INTO chat_analysis ({column_list})
+                SELECT {column_list}
+                FROM chat_analysis_old
+            """)
+        cur.execute("DROP TABLE chat_analysis_old")
+
     db.commit()
     db.close()
 
@@ -369,9 +386,9 @@ def log_analysis_data(session_id, user_message, response, debug_info):
                 match_type,
                 best_similarity,
                 best_user_node_id,
-                top_5_user_nodes,
+                best_assistant_node_id,
+                assistant_candidates,
 
-                assistant_node_id,
                 assistant_intent,
                 assistant_category,
 
@@ -391,6 +408,10 @@ def log_analysis_data(session_id, user_message, response, debug_info):
 
                 sensitive_found,
                 price_corrected,
+                wants_examples,
+                website_examples_used,
+                negotiated_price_detected,
+                negotiated_price_value,
 
                 llm1_prompt,
                 optional_llm_prompt,
@@ -400,7 +421,7 @@ def log_analysis_data(session_id, user_message, response, debug_info):
                 optional_llm_output,
                 llm2_output
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
 
             session_id,
@@ -414,9 +435,9 @@ def log_analysis_data(session_id, user_message, response, debug_info):
             debug_info.get("match_type"),
             debug_info.get("best_similarity"),
             debug_info.get("best_user_node_id"),
-            json.dumps(debug_info.get("top_5_user_nodes", [])),
+            debug_info.get("best_assistant_node_id"),
+            json.dumps(debug_info.get("assistant_candidates", [])),
 
-            debug_info.get("assistant_node_id"),
             debug_info.get("assistant_intent"),
             debug_info.get("assistant_category"),
 
@@ -436,6 +457,14 @@ def log_analysis_data(session_id, user_message, response, debug_info):
 
             int(bool(debug_info.get("sensitive_found"))),
             int(bool(debug_info.get("price_corrected"))),
+            int(bool(debug_info.get("wants_examples"))),
+            int(bool(debug_info.get("website_examples_used"))),
+            int(bool(debug_info.get("negotiated_price_detected"))),
+            (
+                str(debug_info.get("negotiated_price_value"))
+                if debug_info.get("negotiated_price_value") is not None
+                else None
+            ),
 
             debug_info.get("llm1_prompt"),
             debug_info.get("optional_llm_prompt"),
@@ -454,6 +483,184 @@ def log_analysis_data(session_id, user_message, response, debug_info):
         print(f"[ERROR] Failed to log analysis data: {e}")
         print(traceback.format_exc())
 
+def _get_next_node_id(cur):
+    cur.execute("SELECT node_id FROM flow_nodes")
+    max_num = 0
+    for (node_id,) in cur.fetchall():
+        match = re.search(r"(\d+)$", str(node_id))
+        if match:
+            max_num = max(max_num, int(match.group(1)))
+    return f"N{max_num + 1}"
+
+def _insert_flow_node(cur, node_id, intent, category, role):
+    cur.execute(
+        """
+        INSERT INTO flow_nodes (node_id, intent, category, role)
+        VALUES (?, ?, ?, ?)
+        """,
+        (node_id, intent, category, role)
+    )
+
+def _insert_flow_text_if_missing(cur, node_id, chat_text, priority=10):
+    cur.execute(
+        """
+        SELECT 1 FROM flow_texts
+        WHERE node_id = ? AND chat = ?
+        """,
+        (node_id, chat_text)
+    )
+    if cur.fetchone():
+        return False
+
+    cur.execute(
+        """
+        INSERT INTO flow_texts (node_id, chat, priority)
+        VALUES (?, ?, ?)
+        """,
+        (node_id, chat_text, priority)
+    )
+    return True
+
+def _insert_flow_answer_if_missing(cur, from_node_id, intent, to_node_id):
+    cur.execute(
+        """
+        SELECT 1 FROM flow_answers
+        WHERE from_node_id = ? AND intent = ? AND to_node_id = ?
+        """,
+        (from_node_id, intent, to_node_id)
+    )
+    if cur.fetchone():
+        return False
+
+    cur.execute(
+        """
+        INSERT INTO flow_answers (from_node_id, intent, to_node_id)
+        VALUES (?, ?, ?)
+        """,
+        (from_node_id, intent, to_node_id)
+    )
+    return True
+
+def _upsert_intent_embedding(node_id, intent_text):
+    if not node_id or not intent_text:
+        return False
+
+    try:
+        emb_resp = client.embeddings.create(
+            model="text-embedding-3-large",
+            input=intent_text
+        )
+        embedding = emb_resp.data[0].embedding
+        if not embedding:
+            return False
+
+        emb_db = get_db("output/intent_embeddings.db")
+        emb_cur = emb_db.cursor()
+        emb_cur.execute("""
+            CREATE TABLE IF NOT EXISTS intent_embeddings (
+                node_id TEXT PRIMARY KEY,
+                intent TEXT,
+                embedding TEXT
+            )
+        """)
+        emb_cur.execute(
+            """
+            INSERT OR REPLACE INTO intent_embeddings (node_id, intent, embedding)
+            VALUES (?, ?, ?)
+            """,
+            (node_id, intent_text, json.dumps(embedding))
+        )
+        emb_db.commit()
+        emb_db.close()
+        return True
+    except Exception as e:
+        print(f"[WARN] Failed upsert intent embedding for node_id={node_id}: {e}")
+        print(traceback.format_exc())
+        return False
+
+def sync_optional_output_to_global_flow(user_message, debug_info):
+    if not debug_info:
+        logger.debug("[FLOW SYNC] skipped: debug_info empty")
+        return None
+
+    if not debug_info.get("used_optional_llm"):
+        logger.debug("[FLOW SYNC] skipped: used_optional_llm=False")
+        return None
+
+    optional_output = (debug_info.get("optional_llm_output") or "").strip()
+    user_message_clean = (user_message or "").strip()
+    if not optional_output or not user_message_clean:
+        logger.debug("[FLOW SYNC] skipped: optional_output or user_message empty")
+        return None
+
+    user_intent = debug_info.get("user_intent") or "user_optional_llm_autogen"
+    user_category = debug_info.get("user_category") or "follow_up"
+    assistant_intent = debug_info.get("assistant_intent") or "assistant_optional_llm_autogen"
+    assistant_category = debug_info.get("assistant_category") or user_category
+
+    best_user_node_id = debug_info.get("best_user_node_id")
+    assistant_node_id = debug_info.get("best_assistant_node_id")
+
+    db = get_db("output/global_flow.db")
+    cur = db.cursor()
+
+    created_nodes = []
+    inserted_texts = 0
+    inserted_answers = 0
+    upserted_intent_embeddings = 0
+
+    try:
+        if not best_user_node_id:
+            best_user_node_id = _get_next_node_id(cur)
+            _insert_flow_node(cur, best_user_node_id, user_intent, user_category, "user")
+            created_nodes.append(best_user_node_id)
+
+            assistant_node_id = _get_next_node_id(cur)
+            _insert_flow_node(cur, assistant_node_id, assistant_intent, assistant_category, "assistant")
+            created_nodes.append(assistant_node_id)
+
+            if _insert_flow_answer_if_missing(cur, best_user_node_id, assistant_intent, assistant_node_id):
+                inserted_answers += 1
+        elif not assistant_node_id:
+            assistant_node_id = _get_next_node_id(cur)
+            _insert_flow_node(cur, assistant_node_id, assistant_intent, assistant_category, "assistant")
+            created_nodes.append(assistant_node_id)
+
+            if _insert_flow_answer_if_missing(cur, best_user_node_id, assistant_intent, assistant_node_id):
+                inserted_answers += 1
+
+        if _insert_flow_text_if_missing(cur, best_user_node_id, user_message_clean, priority=10):
+            inserted_texts += 1
+
+        if assistant_node_id and _insert_flow_text_if_missing(cur, assistant_node_id, optional_output, priority=10):
+            inserted_texts += 1
+
+        db.commit()
+
+        if _upsert_intent_embedding(best_user_node_id, user_intent):
+            upserted_intent_embeddings += 1
+        if assistant_node_id and _upsert_intent_embedding(assistant_node_id, assistant_intent):
+            upserted_intent_embeddings += 1
+
+        debug_info["best_user_node_id"] = best_user_node_id
+        debug_info["best_assistant_node_id"] = assistant_node_id
+        debug_info["assistant_intent"] = assistant_intent
+        debug_info["assistant_category"] = assistant_category
+
+        return {
+            "created_nodes": created_nodes,
+            "inserted_texts": inserted_texts,
+            "inserted_answers": inserted_answers,
+            "upserted_intent_embeddings": upserted_intent_embeddings
+        }
+    except Exception as e:
+        db.rollback()
+        print(f"[ERROR] Failed sync optional output to global flow: {e}")
+        print(traceback.format_exc())
+        return {"error": str(e)}
+    finally:
+        db.close()
+
 init_analysis_db()
 
 # ==========================
@@ -465,6 +672,10 @@ def chat():
     message = data.get("message")
     session_id = data.get("session_id")
     reset = data.get("reset", False)
+    logger.debug(
+        f"[CHAT REQUEST] session_id={session_id} reset={reset} "
+        f"message_preview='{str(message)[:80] if message else ''}'"
+    )
 
     if not message:
         return jsonify({"error": "message required"}), 400
@@ -478,7 +689,15 @@ def chat():
 
     # Log to analysis.db
     debug_info = result.get("debug", {})
+    flow_sync = sync_optional_output_to_global_flow(message, debug_info)
+    if flow_sync:
+        debug_info["global_flow_sync"] = flow_sync
     log_analysis_data(session_id, message, result["response"], debug_info)
+    logger.debug(
+        f"[CHAT RESPONSE] session_id={session_id} "
+        f"best_user_node_id={debug_info.get('best_user_node_id')} "
+        f"best_assistant_node_id={debug_info.get('best_assistant_node_id')}"
+    )
 
     return jsonify({
         "response": result["response"],
